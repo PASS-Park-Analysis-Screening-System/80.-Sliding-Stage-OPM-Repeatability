@@ -14,7 +14,7 @@ from PySide6.QtCore import Qt, QPointF
 from PySide6.QtGui import QFont, QColor, QPen
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
+    QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget, QHeaderView, QSizePolicy,
 )
 
@@ -100,6 +100,13 @@ class PositionDetailDialog(QDialog):
         self._curve_items: list[pg.PlotDataItem] = []
         self._mean_item: Optional[pg.PlotDataItem] = None
         self._sigma_fill: Optional[pg.FillBetweenItem] = None
+        # Segment measurement state (caliper + band)
+        self._measure_mode = "off"          # "off" | "caliper" | "band"
+        self._caliper_pts: list[float] = []     # clicked x values (max 2)
+        self._caliper_dots: list[tuple] = []    # (x, z) of placed dots
+        self._measure_items: list = []          # pg items to remove on clear
+        self._band_item = None                  # pg.LinearRegionItem
+        self._active_window = None              # (x_a, x_b) of current measurement
         self._setup_ui()
         self._build_curves()
         self._update_visibility()
@@ -142,6 +149,7 @@ class PositionDetailDialog(QDialog):
             "background-color: #181825; border-radius: 3px;")
         self.crosshair_label.setFixedHeight(22)
         self.plot_widget.scene().sigMouseMoved.connect(self._on_mouse_moved)
+        self.plot_widget.scene().sigMouseClicked.connect(self._on_plot_clicked)
 
         chart_container.addWidget(self.plot_widget)
         chart_container.addWidget(self.crosshair_label)
@@ -206,6 +214,9 @@ class PositionDetailDialog(QDialog):
         overlay_layout.addWidget(self.sigma_cb)
 
         right_panel.addWidget(overlay_group)
+
+        # ─── Measure Panel ───
+        self._setup_measure_ui(right_panel)
 
         # ─── Stats Panel ───
         stats_group = QGroupBox("Statistics")
@@ -376,3 +387,227 @@ class PositionDetailDialog(QDialog):
                 self._sigma_fill.setVisible(True)
             else:
                 self._sigma_fill.setVisible(False)
+
+        # Refresh active measurement when the visible repeat set changes
+        if getattr(self, "_active_window", None) is not None:
+            self._recompute(*self._active_window)
+
+    # ─── Segment Measurement (Caliper + Band) ─────────────────
+
+    def _setup_measure_ui(self, parent_layout):
+        """Build the Measure group: mode toggles + Clear + readout table."""
+        measure_group = QGroupBox("Measure (Segment OPM)")
+        mlay = QVBoxLayout(measure_group)
+        mlay.setSpacing(6)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
+        self.caliper_btn = QPushButton("\U0001f4cf Caliper")
+        self.caliper_btn.setCheckable(True)
+        self.caliper_btn.clicked.connect(
+            lambda: self._set_measure_mode(
+                "caliper" if self.caliper_btn.isChecked() else "off"))
+        self.band_btn = QPushButton("▭ Band")
+        self.band_btn.setCheckable(True)
+        self.band_btn.clicked.connect(
+            lambda: self._set_measure_mode(
+                "band" if self.band_btn.isChecked() else "off"))
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(lambda: self._set_measure_mode("off"))
+        for b in (self.caliper_btn, self.band_btn, clear_btn):
+            b.setStyleSheet(
+                "QPushButton { background-color: #313244; color: #cdd6f4;"
+                " border: 1px solid #45475a; border-radius: 4px; padding: 4px 8px; }"
+                "QPushButton:checked { background-color: #89b4fa; color: #11111b;"
+                " font-weight: bold; }")
+            btn_row.addWidget(b)
+        mlay.addLayout(btn_row)
+
+        self.measure_header = QLabel("두 점을 클릭하거나 밴드를 드래그하세요.")
+        self.measure_header.setWordWrap(True)
+        self.measure_header.setStyleSheet(
+            "font-size: 11px; color: #a6adc8; padding: 2px 4px;")
+        mlay.addWidget(self.measure_header)
+
+        self.measure_table = QTableWidget()
+        self.measure_table.setColumnCount(2)
+        self.measure_table.setHorizontalHeaderLabels(["Repeat", "구간 OPM (nm)"])
+        self.measure_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.measure_table.verticalHeader().setVisible(False)
+        self.measure_table.setMaximumHeight(min(28 * len(self.profiles) + 28, 180))
+        mlay.addWidget(self.measure_table)
+
+        self.measure_across = QLabel("")
+        self.measure_across.setStyleSheet(
+            "font-size: 12px; color: #f9e2af; font-weight: bold; padding: 2px 4px;")
+        mlay.addWidget(self.measure_across)
+
+        parent_layout.addWidget(measure_group)
+
+    def _set_measure_mode(self, mode):
+        """Switch measurement mode: 'off' | 'caliper' | 'band'."""
+        self._clear_measurement()
+        self._measure_mode = mode
+        self.caliper_btn.setChecked(mode == "caliper")
+        self.band_btn.setChecked(mode == "band")
+
+        vb = self.plot_widget.getPlotItem().getViewBox()
+        if mode == "caliper":
+            vb.setMouseMode(pg.ViewBox.PanMode)
+            self.measure_header.setText(
+                "곡선 위 두 점을 클릭하세요 (3번째 클릭 = 리셋).")
+        elif mode == "band":
+            vb.setMouseMode(pg.ViewBox.RectMode)
+            self._add_band()
+            self.measure_header.setText("밴드 경계를 드래그해 구간을 조절하세요.")
+        else:
+            vb.setMouseMode(pg.ViewBox.RectMode)
+            self.measure_header.setText("두 점을 클릭하거나 밴드를 드래그하세요.")
+
+    def _add_band(self):
+        """Add a draggable LinearRegionItem at the central third of the X view."""
+        vb = self.plot_widget.getPlotItem().getViewBox()
+        (x0, x1), _ = vb.viewRange()
+        span = x1 - x0
+        a, b = x0 + span / 3.0, x1 - span / 3.0
+        self._band_item = pg.LinearRegionItem(
+            values=(a, b), brush=pg.mkBrush("#89b4fa22"),
+            pen=pg.mkPen("#89b4fa", width=1))
+        self._band_item.setZValue(-5)
+        self.plot_widget.addItem(self._band_item)
+        self._measure_items.append(self._band_item)
+        self._band_item.sigRegionChanged.connect(self._on_band_changed)
+        self._recompute(a, b)
+
+    def _on_band_changed(self):
+        if self._band_item is None:
+            return
+        a, b = self._band_item.getRegion()
+        self._recompute(a, b)
+
+    def _on_plot_clicked(self, ev):
+        """Place caliper points on left-click (caliper mode only)."""
+        if self._measure_mode != "caliper":
+            return
+        if ev.button() != Qt.LeftButton:
+            return
+        if not self.plot_widget.sceneBoundingRect().contains(ev.scenePos()):
+            return
+        vb = self.plot_widget.getPlotItem().getViewBox()
+        pt = vb.mapSceneToView(ev.scenePos())
+        snap = self._snap_x(pt.x(), pt.y())
+        if snap is None:
+            return
+        _, sx, sz = snap
+        self._place_caliper_point(sx, sz)
+
+    def _place_caliper_point(self, sx, sz):
+        """Add a caliper dot/marker; on the 2nd point draw the segment + readout."""
+        if len(self._caliper_pts) >= 2:   # 3rd point resets
+            self._clear_measurement()
+
+        self._caliper_pts.append(sx)
+        self._caliper_dots.append((sx, sz))
+        dot = pg.ScatterPlotItem([sx], [sz], size=10,
+                                 brush=pg.mkBrush("#f38ba8"), pen=pg.mkPen("#11111b"))
+        vline = pg.InfiniteLine(pos=sx, angle=90, movable=False,
+                                pen=pg.mkPen("#f38ba8", width=1, style=Qt.DashLine))
+        self.plot_widget.addItem(dot)
+        self.plot_widget.addItem(vline, ignoreBounds=True)
+        self._measure_items += [dot, vline]
+
+        if len(self._caliper_pts) == 2:
+            (ax, az), (bx, bz) = self._caliper_dots
+            # plain 2-point PlotDataItem; NO clip/downsampling (pg 0.14.0 crash guard)
+            line = pg.PlotDataItem([ax, bx], [az, bz],
+                                   pen=pg.mkPen("#f38ba8", width=1.5, style=Qt.DashLine))
+            self.plot_widget.addItem(line)
+            region = pg.LinearRegionItem(values=sorted((ax, bx)), movable=False,
+                                         brush=pg.mkBrush("#f38ba822"), pen=pg.mkPen(None))
+            region.setZValue(-10)
+            self.plot_widget.addItem(region)
+            self._measure_items += [line, region]
+            self._recompute(ax, bx)
+
+    def _snap_x(self, x_view, y_view):
+        """Snap to the nearest sample of the visible curve closest to the click.
+
+        Returns (index, x, z) or None when no repeat is visible.
+        """
+        best = None  # (vertical_dist, idx, x, z)
+        for i, (_rep_no, x_mm, z_nm, _opm) in enumerate(self.profiles):
+            if not self.repeat_checkboxes[i].isChecked():
+                continue
+            if len(x_mm) == 0:
+                continue
+            idx = int(np.argmin(np.abs(x_mm - x_view)))
+            xx, zz = float(x_mm[idx]), float(z_nm[idx])
+            d = abs(zz - y_view)
+            if best is None or d < best[0]:
+                best = (d, idx, xx, zz)
+        if best is None:
+            return None
+        return best[1], best[2], best[3]
+
+    def _segment_stats(self, x_a, x_b):
+        """Per-repeat segment OPM (max-min within [x_a, x_b]) over visible repeats."""
+        lo, hi = sorted((float(x_a), float(x_b)))
+        rows = []
+        gmax, gmin = -np.inf, np.inf
+        for i, (rep_no, x_mm, z_nm, _opm) in enumerate(self.profiles):
+            if not self.repeat_checkboxes[i].isChecked():
+                continue
+            m = (x_mm >= lo) & (x_mm <= hi)
+            if not m.any():
+                continue
+            zw = z_nm[m]
+            rows.append((rep_no, float(zw.max() - zw.min())))
+            gmax = max(gmax, float(zw.max()))
+            gmin = min(gmin, float(zw.min()))
+        across = (gmax - gmin) if rows else 0.0
+        return rows, across, (hi - lo)
+
+    def _recompute(self, x_a, x_b):
+        """Compute segment stats for [x_a, x_b] and refresh the readout."""
+        rows, across, width = self._segment_stats(x_a, x_b)
+        lo, hi = sorted((float(x_a), float(x_b)))
+
+        if self._measure_mode == "caliper" and len(self._caliper_dots) == 2:
+            (ax, az), (bx, bz) = self._caliper_dots
+            self.measure_header.setText(
+                f"A: x={ax:.3f} z={az:.2f}  |  B: x={bx:.3f} z={bz:.2f}  |  "
+                f"ΔX={abs(bx - ax):.3f} mm  ΔZ={abs(bz - az):.2f} nm")
+        else:
+            self.measure_header.setText(
+                f"구간: [{lo:.3f}, {hi:.3f}] mm  |  폭 ΔX={width:.3f} mm")
+
+        self.measure_table.setRowCount(len(rows))
+        for r, (rep_no, seg) in enumerate(rows):
+            a_item = QTableWidgetItem(f"R{rep_no}")
+            a_item.setTextAlignment(Qt.AlignCenter)
+            b_item = QTableWidgetItem(f"{seg:.3f}")
+            b_item.setTextAlignment(Qt.AlignCenter)
+            self.measure_table.setItem(r, 0, a_item)
+            self.measure_table.setItem(r, 1, b_item)
+
+        self.measure_across.setText(
+            f"Across (envelope) max−min: {across:.3f} nm" if rows
+            else "구간 내 데이터 없음")
+        self._active_window = (float(x_a), float(x_b))
+
+    def _clear_measurement(self):
+        """Remove all measurement items and reset the readout."""
+        for it in self._measure_items:
+            try:
+                self.plot_widget.removeItem(it)
+            except Exception:
+                pass
+        self._measure_items = []
+        self._band_item = None
+        self._caliper_pts = []
+        self._caliper_dots = []
+        self._active_window = None
+        if hasattr(self, "measure_table"):
+            self.measure_table.setRowCount(0)
+        if hasattr(self, "measure_across"):
+            self.measure_across.setText("")
