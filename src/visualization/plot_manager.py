@@ -13,6 +13,9 @@ from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend for embedding in Qt
+matplotlib.rcParams["path.simplify"] = True
+matplotlib.rcParams["path.simplify_threshold"] = 0.1
+matplotlib.rcParams["agg.path.chunksize"] = 10000
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -87,6 +90,9 @@ def create_profile_overlay_figure(recipe: RecipeData,
 
     fig.suptitle(title, color=COLORS["fg"], fontsize=14, fontweight="bold")
 
+    # Display decimation: downsample to ~1500 points for rendering speed
+    _MAX_DISPLAY_PTS = 1500
+
     for pos in POSITION_LABELS:
         row, col = POSITION_GRID[pos]
         ax = axes[row][col]
@@ -105,9 +111,15 @@ def create_profile_overlay_figure(recipe: RecipeData,
                 else:
                     z_leveled = polynomial_flatten(prof.z_nm, x_data=prof.x_mm, order=1)
                     x_plot = prof.x_mm
+                # Decimate for display (min-max preserving)
+                if len(x_plot) > _MAX_DISPLAY_PTS:
+                    step = len(x_plot) // _MAX_DISPLAY_PTS
+                    x_plot = x_plot[::step]
+                    z_leveled = z_leveled[::step]
                 color = COLORS["overlay"][i % len(COLORS["overlay"])]
                 ax.plot(x_plot, z_leveled, color=color, alpha=0.6,
-                        linewidth=0.5, label=f"R{repeat.repeat_no}")
+                        linewidth=0.5, label=f"R{repeat.repeat_no}",
+                        rasterized=True)
                 profiles_found = True
 
         ax.set_title(f"{pos} (Repeats: {recipe.repeat_count})",

@@ -23,7 +23,8 @@ from ..core.analyzer import AnalysisResult
 
 
 # ── pyqtgraph global dark theme ──────────────────────────────
-pg.setConfigOptions(antialias=True, background="#1e1e2e", foreground="#cdd6f4")
+pg.setConfigOptions(antialias=False, background="#1e1e2e", foreground="#cdd6f4",
+                    useOpenGL=True)
 
 # Colors
 _COLORS = {
@@ -96,8 +97,12 @@ class PositionDetailDialog(QDialog):
         self.resize(1150, 720)
         self.setStyleSheet(DARK_STYLE)
 
+        self._curve_items: list[pg.PlotDataItem] = []
+        self._mean_item: Optional[pg.PlotDataItem] = None
+        self._sigma_fill: Optional[pg.FillBetweenItem] = None
         self._setup_ui()
-        self._draw_chart()
+        self._build_curves()
+        self._update_visibility()
 
     def _setup_ui(self):
         main_layout = QHBoxLayout(self)
@@ -176,7 +181,7 @@ class PositionDetailDialog(QDialog):
                 f"QCheckBox {{ color: {color}; font-weight: bold; }}"
                 f"QCheckBox::indicator:checked {{ background-color: {color};"
                 f"border: 2px solid {color}; border-radius: 3px; }}")
-            cb.toggled.connect(self._draw_chart)
+            cb.toggled.connect(self._update_visibility)
             repeat_layout.addWidget(cb, i // 3, i % 3)
             self.repeat_checkboxes.append(cb)
 
@@ -190,14 +195,14 @@ class PositionDetailDialog(QDialog):
         self.mean_cb.setChecked(True)
         self.mean_cb.setStyleSheet(
             f"QCheckBox {{ color: {_COLORS['mean']}; font-weight: bold; }}")
-        self.mean_cb.toggled.connect(self._draw_chart)
+        self.mean_cb.toggled.connect(self._update_visibility)
         overlay_layout.addWidget(self.mean_cb)
 
         self.sigma_cb = QCheckBox("±1σ Band")
         self.sigma_cb.setChecked(False)
         self.sigma_cb.setStyleSheet(
             f"QCheckBox {{ color: {_COLORS['sigma']}; font-weight: bold; }}")
-        self.sigma_cb.toggled.connect(self._draw_chart)
+        self.sigma_cb.toggled.connect(self._update_visibility)
         overlay_layout.addWidget(self.sigma_cb)
 
         right_panel.addWidget(overlay_group)
@@ -283,49 +288,91 @@ class PositionDetailDialog(QDialog):
 
     # ─── Chart Drawing ────────────────────────────────────────
 
-    def _draw_chart(self):
-        """Redraw all curves based on checkbox states."""
-        self.plot_widget.clear()
-        # Re-add crosshair after clear
-        self.plot_widget.addItem(self.vline, ignoreBounds=True)
-        self.plot_widget.addItem(self.hline, ignoreBounds=True)
+    @staticmethod
+    def _decimate(arr: np.ndarray, max_pts: int = 2000) -> np.ndarray:
+        """Downsample array for display performance."""
+        if len(arr) <= max_pts:
+            return arr
+        step = len(arr) // max_pts
+        return arr[::step]
 
-        # Re-add legend
-        if self.legend is not None:
-            try:
-                self.legend.scene().removeItem(self.legend)
-            except Exception:
-                pass
-        self.legend = self.plot_widget.addLegend(
-            offset=(10, 10), labelTextSize="9px",
-            brush=pg.mkBrush("#313244CC"), pen=pg.mkPen("#45475a"))
-
-        visible_z = []
-        visible_x = None
-
+    def _build_curves(self):
+        """Create all curve items once (called on init only)."""
+        self._curve_items = []
         for i, (rep_no, x_mm, z_nm, opm) in enumerate(self.profiles):
-            if i < len(self.repeat_checkboxes) and self.repeat_checkboxes[i].isChecked():
-                color = _COLORS["overlay"][i % len(_COLORS["overlay"])]
-                pen = pg.mkPen(color, width=1.2)
-                self.plot_widget.plot(
-                    x_mm, z_nm, pen=pen,
-                    name=f"R{rep_no} (OPM {opm:.1f})")
-                visible_z.append(z_nm)
-                visible_x = x_mm
+            color = _COLORS["overlay"][i % len(_COLORS["overlay"])]
+            pen = pg.mkPen(color, width=1.2)
+            x_dec = self._decimate(x_mm)
+            z_dec = self._decimate(z_nm)
+            item = pg.PlotDataItem(x_dec, z_dec, pen=pen,
+                                   name=f"R{rep_no} (OPM {opm:.1f})")
+            # pyqtgraph 0.14.0: add to the plot BEFORE enabling clip/downsampling.
+            # Configuring them first makes addItem's view-range cascade query an
+            # un-associated ViewBox -> AttributeError: autoRangeEnabled.
+            self.plot_widget.addItem(item)
+            item.setDownsampling(auto=True, method="peak")
+            item.setClipToView(True)
+            self._curve_items.append(item)
 
-        # Mean profile
-        if visible_z and self.mean_cb.isChecked() and visible_x is not None:
-            mean_z = np.mean(visible_z, axis=0)
+        # Pre-build mean curve (hidden initially if needed)
+        if self.profiles:
+            all_z = [p[2] for p in self.profiles]
+            x0 = self.profiles[0][1]
+            mean_z = np.mean(all_z, axis=0)
+            x_dec = self._decimate(x0)
+            mean_dec = self._decimate(mean_z)
             pen = pg.mkPen(_COLORS["mean"], width=2.5)
-            self.plot_widget.plot(visible_x, mean_z, pen=pen, name="Mean")
+            self._mean_item = pg.PlotDataItem(x_dec, mean_dec, pen=pen, name="Mean")
+            self.plot_widget.addItem(self._mean_item)  # add before clip/downsampling (pg 0.14.0)
+            self._mean_item.setDownsampling(auto=True, method="peak")
+            self._mean_item.setClipToView(True)
 
-            # ±1σ band
-            if self.sigma_cb.isChecked() and len(visible_z) >= 2:
-                std_z = np.std(visible_z, axis=0, ddof=0)
-                upper = mean_z + std_z
-                lower = mean_z - std_z
-                fill = pg.FillBetweenItem(
-                    pg.PlotDataItem(visible_x, upper),
-                    pg.PlotDataItem(visible_x, lower),
+            # Pre-build ±1σ band
+            if len(all_z) >= 2:
+                std_z = np.std(all_z, axis=0, ddof=0)
+                upper_dec = self._decimate(mean_z + std_z)
+                lower_dec = self._decimate(mean_z - std_z)
+                self._sigma_fill = pg.FillBetweenItem(
+                    pg.PlotDataItem(x_dec, upper_dec),
+                    pg.PlotDataItem(x_dec, lower_dec),
                     brush=pg.mkBrush(QColor(_COLORS["sigma"]).lighter(120).name() + "30"))
-                self.plot_widget.addItem(fill)
+                self.plot_widget.addItem(self._sigma_fill)
+
+    def _update_visibility(self):
+        """Toggle curve visibility without rebuilding (fast)."""
+        visible_indices = []
+        for i, item in enumerate(self._curve_items):
+            visible = (i < len(self.repeat_checkboxes)
+                       and self.repeat_checkboxes[i].isChecked())
+            item.setVisible(visible)
+            if visible:
+                visible_indices.append(i)
+
+        # Update mean + sigma with visible-only data
+        show_mean = self.mean_cb.isChecked() and visible_indices
+        if self._mean_item is not None:
+            if show_mean:
+                visible_z = [self.profiles[i][2] for i in visible_indices]
+                x0 = self.profiles[0][1]
+                mean_z = np.mean(visible_z, axis=0)
+                x_dec = self._decimate(x0)
+                self._mean_item.setData(x_dec, self._decimate(mean_z))
+                self._mean_item.setVisible(True)
+            else:
+                self._mean_item.setVisible(False)
+
+        show_sigma = (self.sigma_cb.isChecked() and show_mean
+                      and len(visible_indices) >= 2)
+        if self._sigma_fill is not None:
+            if show_sigma:
+                visible_z = [self.profiles[i][2] for i in visible_indices]
+                x0 = self.profiles[0][1]
+                mean_z = np.mean(visible_z, axis=0)
+                std_z = np.std(visible_z, axis=0, ddof=0)
+                x_dec = self._decimate(x0)
+                self._sigma_fill.setCurves(
+                    pg.PlotDataItem(x_dec, self._decimate(mean_z + std_z)),
+                    pg.PlotDataItem(x_dec, self._decimate(mean_z - std_z)))
+                self._sigma_fill.setVisible(True)
+            else:
+                self._sigma_fill.setVisible(False)

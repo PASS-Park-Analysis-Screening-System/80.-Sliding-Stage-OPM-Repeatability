@@ -1,0 +1,149 @@
+# OPM Repeatability 지표 알고리즘 명세
+
+> 연구소 기술 문의 답변 (2026-04) 기반 정리.
+> 기준 Tool 소스 코드 확인 결과를 반영한 정확한 계산 방식입니다.
+
+---
+
+## 1. 공통 전처리
+
+### 1-1. Order-1 LS Flatten (Edge-Only Fitting)
+
+모든 지표는 동일한 Flatten을 사용합니다.
+
+| 항목 | 값 |
+|------|-----|
+| 방식 | 1차 최소자승 (LS) 회귀 |
+| Fitting 구간 | **양끝 1% 픽셀만** (left 1% + right 1%) |
+| 적용 구간 | 전체 픽셀 |
+
+**수식:**
+```
+edge_pixels = max(1, int(N * 0.01))
+x_fit = x[:edge_pixels] + x[-edge_pixels:]     # 양끝 1%만
+z_fit = z[:edge_pixels] + z[-edge_pixels:]
+
+coefficients = polyfit(x_fit, z_fit, order=1)   # 1차 LS 회귀
+regression = polyval(coefficients, x_all)       # 전체 구간에 평가
+
+z_flat = z_raw - regression                     # 전체에서 차감
+```
+
+**핵심**: 기존 `FlattenProcessor.flatten(edge_percent=1.0)`은 inner pixels로 fitting (양끝 제외).
+연구소 기준은 **양끝 pixels로만 fitting** (정반대). `edge_only_flatten()` 함수로 구현.
+
+### 1-2. Outlier Pixel Exclusion
+
+분석 전에 비정상 픽셀을 제외합니다.
+
+**기준**: 각 pixel 위치에서 repeat간 Max-Min 범위 계산 → 범위가 큰 pixel 제외
+
+| 모드 | 설명 |
+|------|------|
+| Percentile | 상위 x% pixel 제외 (예: 5% → pixel_range 상위 5% 제외) |
+| Pixels | 상위 N개 pixel 제외 (예: 10 → range가 가장 큰 10개 pixel 제외) |
+| None | 제외 없음 (모든 pixel 사용) |
+
+**수식:**
+```
+stack = [z_flat_repeat1, z_flat_repeat2, ..., z_flat_repeatN]  # shape: (repeats, pixels)
+pixel_range = stack.max(axis=0) - stack.min(axis=0)             # shape: (pixels,)
+
+# Percentile 모드 (예: value=5.0)
+threshold = percentile(pixel_range, 95)     # 100 - 5 = 95번째 백분위
+valid_mask = pixel_range <= threshold       # 상위 5% 제외
+
+# Pixels 모드 (예: value=10)
+sorted_idx = argsort(pixel_range)
+valid_mask[sorted_idx[-10:]] = False        # 상위 10개 제외
+```
+
+---
+
+## 2. 지표별 계산 공식
+
+### 2-1. Rep. Max (Repeatability Maximum)
+
+**의미**: 동일 위치에서 repeat간 높이 편차의 최대값
+
+```
+pixel_range[i] = max(z_flat[repeat, i]) - min(z_flat[repeat, i])   # 각 유효 pixel i
+Rep. Max = max(pixel_range[valid_pixels])
+```
+
+### 2-2. Rep. 1σ (Repeatability 1-Sigma)
+
+**의미**: 각 pixel에서 repeat간 표준편차의 RMS 집계
+
+```
+pixel_std[i] = std(z_flat[:, i], ddof=0)    # 각 유효 pixel i에서 repeat간 std
+Rep. 1σ = sqrt(mean(pixel_std[valid_pixels]²))   # RMS 집계
+```
+
+**주의**: `std(pixel_range)`가 아님. pixel별 repeat std → RMS.
+
+### 2-3. OPM Max (Optical Profiler Measurement Maximum)
+
+**의미**: 각 repeat에서 유효 pixel의 높이 범위(Max-Min)의 최대값
+
+```
+OPM[r] = max(z_flat[r, valid]) - min(z_flat[r, valid])    # repeat r의 유효 pixel OPM
+OPM Max = max(OPM[r])                                      # 전체 repeat 중 최대
+```
+
+### 2-4. OPM 1σ
+
+**의미**: Leveling 후 프로파일 형상의 RMS 크기 (Bow의 RMS)
+
+```
+all_heights = z_flat[all_repeats, valid_pixels].ravel()    # 모든 repeat × 유효 pixel
+OPM 1σ = sqrt(mean(all_heights²))                          # RMS from zero
+```
+
+**핵심**: 이것은 5회 OPM의 변동성(반복성)이 **아닙니다**.
+모든 repeat의 유효 pixel 높이값 전체에 대한 zero 기준 RMS입니다.
+평균을 다시 빼지 않으므로 "from zero"입니다.
+
+---
+
+## 3. 검증 기준값 (1mm 데이터, 1_LT Position)
+
+| 지표 | 기준 Tool | 이전 구현 (v1) | 수정 후 목표 |
+|------|-----------|---------------|-------------|
+| Rep. Max | 7.596 nm | 7.595 nm (✅) | ~7.596 nm |
+| Rep. 1σ | 1.736 nm | 1.096 nm (❌ -37%) | ~1.736 nm |
+| OPM Max | 104.788 nm | 102.231 nm (⚠️) | ~104.788 nm |
+| OPM 1σ | 67.801 nm | 1.810 nm (❌ 37.6배) | ~67.801 nm |
+
+### 이상치 사례: 3_RT Position, Sample18
+
+| 항목 | 값 | 비고 |
+|------|-----|------|
+| Raw Range | 148.160 nm | 정상 범위 97~100 nm 대비 +50% |
+| Rep. Max (이상치 포함) | 62.083 nm | 기준 Tool 9.834 nm 대비 6.3배 |
+| OPM Max (이상치 포함) | 149.397 nm | 기준 Tool 104.412 nm 대비 +43% |
+| OPM Max (Sample18 제외) | ~104.540 nm | 기준 Tool과 근접 |
+
+→ Outlier 모드 활성화 시 Sample18의 비정상 pixel이 자동 제외되어야 함.
+
+---
+
+## 4. 이전 구현과의 차이 (v1 → v2)
+
+| 항목 | v1 (이전) | v2 (수정) |
+|------|-----------|-----------|
+| Rep 용 Flatten | Order-2, 전체구간 LS | **Order-1, 양끝 1% fitting** |
+| OPM 용 Flatten | Order-1, 전체구간 LS | **Order-1, 양끝 1% fitting** |
+| Outlier 제외 | 없음 | **pixel Max-Min 기반 상위 x%/N개 제외** |
+| Rep. 1σ 공식 | `std(pixel_range)` | **`sqrt(mean(pixel_stds²))`** — RMS |
+| OPM 1σ 공식 | `std(opm_values)` — 5회 OPM의 stdev | **`sqrt(mean(all_heights²))`** — RMS from zero |
+| OPM 계산 pixel | 전체 pixel | **유효 pixel만** |
+
+---
+
+## 5. 변경 이력
+
+| 버전 | 날짜 | 변경 내용 |
+|------|------|-----------|
+| v1.0 | 2026-03 | 초기 구현 (Order-2 flatten for Rep, Order-1 for OPM, 전체구간 fitting) |
+| v2.0 | 2026-04 | 연구소 답변 기반 수정_PMS: Q&A 4249 (Order-1 edge-only flatten, outlier exclusion, 공식 변경) |

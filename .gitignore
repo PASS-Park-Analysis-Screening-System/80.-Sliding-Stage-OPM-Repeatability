@@ -38,6 +38,8 @@ Desktop.ini
 
 # Gemini / AI artifacts
 .gemini/
+.claude/
+.omc/
 
 # Debug / Temp scripts (local only)
 _debug_*.py

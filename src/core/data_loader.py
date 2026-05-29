@@ -181,11 +181,42 @@ def _parse_metadata_csv(csv_path: Path) -> dict[str, str]:
 
 
 def _detect_range_mm(directory_name: str) -> Optional[int]:
-    """Detect recipe range from directory name (e.g., '25mm' → 25)."""
-    match = re.match(r"(\d+)mm", directory_name, re.IGNORECASE)
+    """Detect recipe range from directory name.
+
+    Matches ``\\d+mm`` anywhere in the name (case-insensitive), so both
+    ``25mm`` and ``Profile_25mm_Dynamic`` resolve to 25. Allows optional
+    whitespace between digits and 'mm' (e.g., ``25 mm``).
+    """
+    match = re.search(r"(\d+)\s*mm", directory_name, re.IGNORECASE)
     if match:
         return int(match.group(1))
     return None
+
+
+def find_recipe_directories(root: Path, max_depth: int = 3) -> list[Path]:
+    """Recursively find recipe directories (matching ``\\d+mm``) under ``root``.
+
+    Depth is counted from ``root`` (depth 0 = root itself). Descent stops when
+    a recipe directory is found (recipes are not nested inside each other).
+    Inaccessible directories are silently skipped.
+    """
+    found: list[Path] = []
+
+    def _walk(p: Path, depth: int) -> None:
+        if _detect_range_mm(p.name) is not None and depth > 0:
+            found.append(p)
+            return  # Don't descend into a recipe directory
+        if depth >= max_depth:
+            return
+        try:
+            children = [c for c in p.iterdir() if c.is_dir()]
+        except (PermissionError, OSError):
+            return
+        for child in children:
+            _walk(child, depth + 1)
+
+    _walk(root, 0)
+    return found
 
 
 def _find_repeat_directories(recipe_dir: Path) -> list[Path]:
@@ -329,13 +360,10 @@ def load_dataset(root_dir: str | Path, signal_source: str = "Height",
         raise FileNotFoundError(f"Directory not found: {root}")
 
     recipes = {}
-    for subdir in sorted(root.iterdir()):
-        if not subdir.is_dir():
-            continue
-        range_mm = _detect_range_mm(subdir.name)
-        if range_mm is not None:
-            recipe = load_recipe(subdir, signal_source=signal_source,
-                                 load_profiles=load_profiles)
-            recipes[recipe.range_label] = recipe
+    recipe_dirs = find_recipe_directories(root, max_depth=3)
+    for subdir in sorted(recipe_dirs):
+        recipe = load_recipe(subdir, signal_source=signal_source,
+                             load_profiles=load_profiles)
+        recipes[recipe.range_label] = recipe
 
     return DataSet(root_directory=root, recipes=recipes)

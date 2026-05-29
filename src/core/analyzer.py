@@ -18,7 +18,7 @@ from typing import Optional
 import numpy as np
 
 from .data_loader import RecipeData, POSITION_LABELS
-from .flatten import polynomial_flatten
+from .flatten import polynomial_flatten, edge_only_flatten
 
 # Position group definitions for Edge/Center/Side analysis
 POSITION_GROUPS = {
@@ -125,47 +125,100 @@ class AnalysisResult:
         return float(np.sqrt(np.mean(np.array(vals) ** 2)))
 
 
-def _compute_position_result(position: str,
-                              profiles_z_flat2: list[np.ndarray],
-                              opm_leveled: list[float]) -> PositionResult:
-    """Compute statistics for one position across repeats.
+def _exclude_outlier_pixels(stack: np.ndarray,
+                            mode: str = "none",
+                            value: float = 0.0) -> np.ndarray:
+    """Return boolean mask (pixels,) where True = valid pixel.
 
-    Metrics:
-        - Rep. Max: Max of pixel-wise range across repeats
-                    (computed on Order-2 flattened profiles)
-        - Rep. 1σ:  Stdev of pixel-wise range across repeats
-        - OPM Max:  Max of per-profile OPM values
-                    (computed on Order-1 leveled profiles)
-        - OPM 1σ:   Stdev of per-profile OPM values
+    Outlier pixels are those with large repeat-to-repeat Max-Min range.
+    - mode="percentile": exclude top value% of pixels by range
+    - mode="pixels": exclude top int(value) pixels by range
+    """
+    pixel_range = stack.max(axis=0) - stack.min(axis=0)  # (pixels,)
+    mask = np.ones(len(pixel_range), dtype=bool)
+
+    if mode == "percentile" and value > 0:
+        threshold = np.percentile(pixel_range, 100 - value)
+        mask = pixel_range <= threshold
+    elif mode == "pixels" and value > 0:
+        n_remove = min(int(value), len(pixel_range) - 1)
+        if n_remove > 0:
+            sorted_indices = np.argsort(pixel_range)
+            mask[sorted_indices[-n_remove:]] = False
+
+    return mask
+
+
+def _compute_position_result(position: str,
+                              profiles_flat: list[np.ndarray],
+                              outlier_mode: str = "none",
+                              outlier_value: float = 0.0) -> PositionResult:
+    """Compute 4 metrics for one position across repeats.
+
+    All metrics use the same Order-1 edge-only flattened profiles.
+
+    Metrics (per reference tool algorithm):
+        - Rep. Max:  Max of pixel-wise range across repeats (valid pixels only)
+        - Rep. 1σ:   RMS of per-pixel repeat stdev (valid pixels only)
+        - OPM Max:   Max of per-repeat OPM on valid pixels
+        - OPM 1σ:    RMS from zero of all heights at valid pixels across all repeats
 
     Args:
-        profiles_z_flat2: List of Order-2 flattened Z arrays (one per repeat).
-        opm_leveled: List of OPM (Max-Min) values from Order-1 leveled profiles.
+        profiles_flat: List of Order-1 edge-only flattened Z arrays (one per repeat).
+        outlier_mode: "none", "percentile", or "pixels".
+        outlier_value: Threshold for outlier exclusion.
     """
-    opm_arr = np.array(opm_leveled, dtype=np.float64)
+    stack = np.array(profiles_flat, dtype=np.float64)  # (repeats, pixels)
 
-    # Pixel-wise repeatability on Order-2 flattened profiles
-    if len(profiles_z_flat2) >= 2:
-        stack = np.array(profiles_z_flat2, dtype=np.float64)  # (repeats, pixels)
-        pixel_range = stack.max(axis=0) - stack.min(axis=0)   # (pixels,)
-        rep_max = float(pixel_range.max())
-        rep_1sigma = float(pixel_range.std(ddof=0))
+    # Outlier pixel exclusion based on repeat-to-repeat range
+    valid = _exclude_outlier_pixels(stack, outlier_mode, outlier_value)
+    has_valid = valid.any()
+
+    # Rep. Max: max pixel-wise range on valid pixels
+    pixel_range = stack.max(axis=0) - stack.min(axis=0)  # (pixels,)
+    rep_max = float(pixel_range[valid].max()) if has_valid else 0.0
+
+    # Rep. 1σ: RMS of per-pixel repeat stdev on valid pixels
+    if stack.shape[0] >= 2 and has_valid:
+        pixel_stds = stack.std(axis=0, ddof=0)  # std across repeats per pixel
+        rep_1sigma = float(np.sqrt(np.mean(pixel_stds[valid] ** 2)))
     else:
-        rep_max = 0.0
         rep_1sigma = 0.0
+
+    # OPM per repeat: max-min on valid pixels only
+    opm_per_repeat = []
+    for i in range(stack.shape[0]):
+        if has_valid:
+            vals = stack[i, valid]
+            opm_per_repeat.append(float(vals.max() - vals.min()))
+        else:
+            opm_per_repeat.append(0.0)
+    opm_arr = np.array(opm_per_repeat, dtype=np.float64)
+
+    # OPM Max
+    opm_max = float(opm_arr.max())
+
+    # OPM 1σ: RMS from zero of ALL heights at valid pixels across ALL repeats
+    if has_valid:
+        all_heights = stack[:, valid].ravel()
+        opm_1sigma = float(np.sqrt(np.mean(all_heights ** 2)))
+    else:
+        opm_1sigma = 0.0
 
     return PositionResult(
         position=position,
         opm_values=opm_arr,
         rep_max=rep_max,
         rep_1sigma=rep_1sigma,
-        opm_max=float(opm_arr.max()),
-        opm_1sigma=float(opm_arr.std(ddof=0)),
-        repeat_count=len(opm_leveled),
+        opm_max=opm_max,
+        opm_1sigma=opm_1sigma,
+        repeat_count=len(profiles_flat),
     )
 
 
-def _evaluate_window(recipe: RecipeData, start: int, count: int) -> Optional[WindowResult]:
+def _evaluate_window(recipe: RecipeData, start: int, count: int,
+                     outlier_mode: str = "none",
+                     outlier_value: float = 0.0) -> Optional[WindowResult]:
     """Evaluate a single sliding window of consecutive repeats."""
     end = start + count
     if end > len(recipe.repeats):
@@ -175,19 +228,16 @@ def _evaluate_window(recipe: RecipeData, start: int, count: int) -> Optional[Win
     positions = {}
 
     for pos in POSITION_LABELS:
-        opm_leveled = []
-        profiles_z_flat2 = []
+        profiles_flat = []
         for repeat in window_repeats:
             if pos in repeat.profiles:
                 z_raw = repeat.profiles[pos].z_nm
-                # Order-2 flatten for Rep. Max / Rep. 1σ
-                profiles_z_flat2.append(polynomial_flatten(z_raw, order=2))
-                # Order-1 leveling for OPM Max / OPM 1σ
-                z_lev = polynomial_flatten(z_raw, order=1)
-                opm_leveled.append(float(z_lev.max() - z_lev.min()))
+                # Order-1 edge-only flatten for all metrics
+                profiles_flat.append(edge_only_flatten(z_raw, order=1, edge_percent=1.0))
 
-        if opm_leveled:
-            positions[pos] = _compute_position_result(pos, profiles_z_flat2, opm_leveled)
+        if profiles_flat:
+            positions[pos] = _compute_position_result(
+                pos, profiles_flat, outlier_mode, outlier_value)
 
     if not positions:
         return None
@@ -208,13 +258,17 @@ def _evaluate_window(recipe: RecipeData, start: int, count: int) -> Optional[Win
 
 
 def analyze_recipe(recipe: RecipeData, window_size: int = 5,
-                   equipment_type: str = "iso") -> AnalysisResult:
+                   equipment_type: str = "iso",
+                   outlier_mode: str = "none",
+                   outlier_value: float = 0.0) -> AnalysisResult:
     """Perform full OPM Repeatability analysis on a recipe.
 
     Args:
         recipe: RecipeData with loaded profiles.
         window_size: Number of consecutive repeats for Best-5 window.
         equipment_type: Equipment type - "iso" (Isolated AE / 분리형) or "dw" (Double Walled AE / 일체형).
+        outlier_mode: "none", "percentile", or "pixels" for outlier pixel exclusion.
+        outlier_value: Threshold for outlier exclusion.
 
     Returns:
         AnalysisResult with per-position stats, Best-5 window, and spec judgment.
@@ -224,25 +278,23 @@ def analyze_recipe(recipe: RecipeData, window_size: int = 5,
     # --- Compute ALL-repeat statistics per position ---
     all_positions = {}
     for pos in POSITION_LABELS:
-        opm_leveled = []
-        profiles_z_flat2 = []
+        profiles_flat = []
         for repeat in recipe.repeats:
             if pos in repeat.profiles:
                 z_raw = repeat.profiles[pos].z_nm
-                # Order-2 flatten for Rep. Max / Rep. 1σ
-                profiles_z_flat2.append(polynomial_flatten(z_raw, order=2))
-                # Order-1 leveling for OPM Max / OPM 1σ
-                z_lev = polynomial_flatten(z_raw, order=1)
-                opm_leveled.append(float(z_lev.max() - z_lev.min()))
+                # Order-1 edge-only flatten for all metrics
+                profiles_flat.append(edge_only_flatten(z_raw, order=1, edge_percent=1.0))
 
-        if opm_leveled:
-            all_positions[pos] = _compute_position_result(pos, profiles_z_flat2, opm_leveled)
+        if profiles_flat:
+            all_positions[pos] = _compute_position_result(
+                pos, profiles_flat, outlier_mode, outlier_value)
 
     # --- Evaluate ALL sliding windows ---
     all_windows = []
     if n_repeats >= window_size:
         for start in range(n_repeats - window_size + 1):
-            w = _evaluate_window(recipe, start, window_size)
+            w = _evaluate_window(recipe, start, window_size,
+                                 outlier_mode, outlier_value)
             if w:
                 all_windows.append(w)
 

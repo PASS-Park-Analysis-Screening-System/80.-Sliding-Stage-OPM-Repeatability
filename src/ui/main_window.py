@@ -8,7 +8,11 @@ UX Flow:
 """
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -31,7 +35,7 @@ import numpy as np
 
 from ..core.data_loader import (
     load_recipe, load_dataset, DataSet, RecipeData, POSITION_LABELS,
-    POSITION_GRID, _detect_range_mm,
+    POSITION_GRID, _detect_range_mm, find_recipe_directories,
 )
 from ..core.analyzer import analyze_recipe, AnalysisResult, get_summary_table
 from ..core.qc_checker import run_qc_checks, QCResult
@@ -134,13 +138,46 @@ class LoadWorker(QThread):
             self.error.emit(f"{type(e).__name__}: {e}")
 
 
-def _detect_folder_type(path: Path) -> str:
-    """Detect folder type: 'root', 'recipe', or 'unknown'."""
+class CopyWorker(QThread):
+    """Copy server/network folder to local temp via robocopy (DLP bypass)."""
+    finished = Signal(str)   # local path after copy
+    error = Signal(str)
+
+    def __init__(self, source: str):
+        super().__init__()
+        self.source = source
+
+    def run(self):
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="opm_")
+            dest = os.path.join(tmp_dir, Path(self.source).name)
+            result = subprocess.run(
+                ["robocopy", self.source, dest, "/E", "/NP", "/NFL", "/NDL"],
+                capture_output=True, text=True, timeout=300,
+            )
+            # robocopy exit codes: 0-7 = success, 8+ = error
+            if result.returncode >= 8:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                raise RuntimeError(
+                    f"robocopy failed (exit {result.returncode}): {result.stderr.strip()}"
+                )
+            self.finished.emit(dest)
+        except Exception as e:
+            self.error.emit(f"{type(e).__name__}: {e}")
+
+
+def _detect_folder_type(path: Path, max_depth: int = 3) -> str:
+    """Detect folder type: 'root', 'recipe', or 'unknown'.
+
+    Searches up to ``max_depth`` levels below ``path`` for a recipe
+    directory (matching ``\\d+mm`` anywhere in the name). This tolerates
+    an intermediate folder layer (e.g., server layouts like
+    ``.../03. Sliding Stage OPM Repeatability !!/Profile_25mm_Dynamic/...``).
+    """
     if _detect_range_mm(path.name) is not None:
         return "recipe"
-    for child in path.iterdir():
-        if child.is_dir() and _detect_range_mm(child.name) is not None:
-            return "root"
+    if find_recipe_directories(path, max_depth=max_depth):
+        return "root"
     return "unknown"
 
 
@@ -238,6 +275,11 @@ class MainWindow(QMainWindow):
         self.res_slider.setValue(1)
         self.res_slider.setFixedWidth(200)
         self.res_slider.setToolTip("Simulate lower resolution by block-averaging pixels")
+        # Debounced connection: update label immediately, but defer chart redraw
+        self._res_debounce = QTimer()
+        self._res_debounce.setSingleShot(True)
+        self._res_debounce.setInterval(150)
+        self._res_debounce.timeout.connect(self._update_profile_chart)
         self.res_slider.valueChanged.connect(self._on_res_slider_changed)
         _toolbar.addWidget(self.res_slider)
         self.res_slider_label = QLabel("Original")
@@ -395,6 +437,52 @@ class MainWindow(QMainWindow):
         best5_row.addStretch()
         best5_inner.addLayout(best5_row)
         layout.addWidget(best5_frame)
+
+        # Outlier Exclusion
+        outlier_frame = QFrame()
+        outlier_frame.setStyleSheet(
+            "QFrame#outlierFrame { border: 1px solid #45475a; border-radius: 6px; }")
+        outlier_frame.setObjectName("outlierFrame")
+        outlier_inner = QVBoxLayout(outlier_frame)
+        outlier_inner.setContentsMargins(10, 6, 10, 8)
+        outlier_inner.setSpacing(4)
+
+        outlier_title = QLabel("Outlier Exclusion")
+        outlier_title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 12px;")
+        outlier_inner.addWidget(outlier_title)
+
+        outlier_row1 = QHBoxLayout()
+        outlier_row1.addWidget(QLabel("Mode:"))
+        self.outlier_mode_combo = QComboBox()
+        self.outlier_mode_combo.addItems(["None", "Percentile", "Pixels"])
+        self.outlier_mode_combo.setFixedSize(120, 28)
+        self.outlier_mode_combo.setStyleSheet(
+            "QComboBox { background: #1e1e2e; border: 1px solid #45475a; "
+            "border-radius: 4px; padding: 2px 6px; color: #cdd6f4; }")
+        self.outlier_mode_combo.currentTextChanged.connect(self._on_outlier_mode_changed)
+        outlier_row1.addWidget(self.outlier_mode_combo)
+        outlier_row1.addStretch()
+        outlier_inner.addLayout(outlier_row1)
+
+        outlier_row2 = QHBoxLayout()
+        self.outlier_value_label = QLabel("Value:")
+        outlier_row2.addWidget(self.outlier_value_label)
+        self.outlier_value_spin = QDoubleSpinBox()
+        self.outlier_value_spin.setRange(0.0, 100.0)
+        self.outlier_value_spin.setValue(5.0)
+        self.outlier_value_spin.setDecimals(1)
+        self.outlier_value_spin.setSuffix(" %")
+        self.outlier_value_spin.setFixedSize(100, 28)
+        self.outlier_value_spin.setStyleSheet(
+            "QDoubleSpinBox { background: #1e1e2e; border: 1px solid #45475a; "
+            "border-radius: 4px; padding: 2px 6px; color: #cdd6f4; }")
+        self.outlier_value_spin.setEnabled(False)
+        self.outlier_value_spin.valueChanged.connect(self._on_reanalyze)
+        outlier_row2.addWidget(self.outlier_value_spin)
+        outlier_row2.addStretch()
+        outlier_inner.addLayout(outlier_row2)
+
+        layout.addWidget(outlier_frame)
 
         # Spec Judgment — redesigned with equipment type + dual spec
         spec_frame = QFrame()
@@ -1074,9 +1162,13 @@ class MainWindow(QMainWindow):
 
             equipment_type = "dw" if self.equip_dw_radio.isChecked() else "iso"
             window_size = self.window_spin.value()
+            outlier_mode = self.outlier_mode_combo.currentText().lower()
+            outlier_value = self.outlier_value_spin.value() if outlier_mode != "none" else 0.0
             self.reference_result = analyze_recipe(
                 ref_recipe, window_size=window_size,
-                equipment_type=equipment_type)
+                equipment_type=equipment_type,
+                outlier_mode=outlier_mode,
+                outlier_value=outlier_value)
 
             self.current_compare_result = compare_results(
                 self.current_result, self.reference_result)
@@ -1378,18 +1470,20 @@ class MainWindow(QMainWindow):
             <h2>Summary Table</h2>
             <p>Position별 통계 테이블입니다. Best-5 Window 기준 데이터를 사용합니다.</p>
 
-            <h3>지표 설명</h3>
+            <h3>지표 계산 알고리즘</h3>
+            <p><b>공통 전처리</b>: Order-1 LS Flatten (양끝 1% 픽셀로만 fitting, 전체에 적용) + Outlier pixel 제외</p>
             <table>
-            <tr><th>지표</th><th>정의</th><th>의미</th></tr>
+            <tr><th>지표</th><th>공식</th><th>의미</th></tr>
             <tr><td><span class='metric'>Rep. Max</span></td>
-                <td>Pixel-wise Range의 최대값</td><td>재현성 최악 지점</td></tr>
+                <td>유효 pixel의 repeat간 Max-Min 중 최대값</td><td>재현성 최악 지점</td></tr>
             <tr><td><span class='metric'>Rep. 1σ</span></td>
-                <td>Pixel-wise Range의 표준편차</td><td>재현성 산포</td></tr>
+                <td>유효 pixel별 repeat std의 RMS<br><code>sqrt(mean(pixel_stds²))</code></td><td>재현성 RMS 산포</td></tr>
             <tr><td><span class='metric'>OPM Max</span></td>
-                <td>Profile별 Max-Min 중 최대값</td><td>프로파일 형상 크기</td></tr>
+                <td>repeat별 유효 pixel Max-Min 중 최대값</td><td>프로파일 형상 크기</td></tr>
             <tr><td><span class='metric'>OPM 1σ</span></td>
-                <td>Profile별 Max-Min의 표준편차</td><td>형상 변동성</td></tr>
+                <td>전체 repeat×유효 pixel 높이의 RMS from zero<br><code>sqrt(mean(all_heights²))</code></td><td>Leveling 후 형상 RMS (Bow 크기)</td></tr>
             </table>
+            <p class='note'>상세 명세: <code>docs/algorithm_spec.md</code> 참조</p>
 
             <h3>Total 행 해석</h3>
             <ul>
@@ -1415,8 +1509,8 @@ class MainWindow(QMainWindow):
             <h3>Order 선택 가이드</h3>
             <table>
             <tr><th>Order</th><th>제거 성분</th><th>용도</th></tr>
-            <tr><td>1 (Linear)</td><td>Tilt</td><td>OPM Leveling</td></tr>
-            <tr><td>2 (Quadratic)</td><td>Tilt + Bow</td><td>Repeatability 분석</td></tr>
+            <tr><td>1 (Linear)</td><td>Tilt</td><td>OPM + Repeatability 분석 (기본)</td></tr>
+            <tr><td>2 (Quadratic)</td><td>Tilt + Bow</td><td>수동 탐색용</td></tr>
             <tr><td>3+</td><td>고차 Waviness</td><td>특수 분석</td></tr>
             </table>
 
@@ -1696,6 +1790,46 @@ class MainWindow(QMainWindow):
         self._start_load(folder)
 
     def _start_load(self, folder: str):
+        self._cleanup_temp()
+        path = Path(folder)
+
+        # DLP bypass: if iterdir() raises PermissionError, copy via robocopy
+        if self._needs_local_copy(path):
+            self.load_btn.setEnabled(False)
+            self.statusBar().showMessage("Copying from server (DLP bypass)...")
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)
+            self._copy_worker = CopyWorker(folder)
+            self._copy_worker.finished.connect(self._on_copy_finished)
+            self._copy_worker.error.connect(self._on_load_error)
+            self._copy_worker.start()
+            return
+
+        self._start_load_local(folder)
+
+    def _needs_local_copy(self, path: Path) -> bool:
+        """Check if path triggers PermissionError (DLP-blocked network path)."""
+        try:
+            next(path.iterdir())
+            return False
+        except PermissionError:
+            return True
+        except StopIteration:
+            return False
+
+    def _on_copy_finished(self, local_path: str):
+        """After robocopy completes, load from local temp path."""
+        self._temp_data_dir = local_path
+        self.statusBar().showMessage("Server copy complete. Loading data...")
+        self._start_load_local(local_path)
+
+    def _cleanup_temp(self):
+        """Remove temporary data directory from previous server copy."""
+        if hasattr(self, '_temp_data_dir') and self._temp_data_dir:
+            shutil.rmtree(self._temp_data_dir, ignore_errors=True)
+            self._temp_data_dir = None
+
+    def _start_load_local(self, folder: str):
         path = Path(folder)
         folder_type = _detect_folder_type(path)
 
@@ -1708,14 +1842,19 @@ class MainWindow(QMainWindow):
                     f"Please select the recipe folder:\n{path.parent}\n\n"
                     f"Or select the root data folder to load all recipes."
                 )
+                self.load_btn.setEnabled(True)
+                self.progress_bar.setVisible(False)
                 return
             else:
                 QMessageBox.warning(
                     self, "Unrecognized folder",
                     f"Could not detect recipe data in:\n{folder}\n\n"
-                    f"Expected folder names like '25mm', '10mm', '5mm', '1mm'\n"
-                    f"or a parent folder containing them."
+                    f"Expected folder names containing a range pattern like\n"
+                    f"'25mm', '10mm', '5mm', '1mm' (e.g., 'Profile_25mm_Dynamic').\n"
+                    f"Recipe folders may be up to 3 levels below the selected folder."
                 )
+                self.load_btn.setEnabled(True)
+                self.progress_bar.setVisible(False)
                 return
 
         self._loaded_path = folder
@@ -1766,6 +1905,10 @@ class MainWindow(QMainWindow):
         self.load_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
         QMessageBox.critical(self, "Load Error", msg)
+
+    def closeEvent(self, event):
+        self._cleanup_temp()
+        super().closeEvent(event)
 
     def _populate_range_selector(self):
         self._block_range_signal = True
@@ -1903,6 +2046,21 @@ class MainWindow(QMainWindow):
 
         dlg.exec()
 
+    def _on_outlier_mode_changed(self, text: str):
+        is_active = text != "None"
+        self.outlier_value_spin.setEnabled(is_active)
+        if text == "Pixels":
+            self.outlier_value_spin.setSuffix("")
+            self.outlier_value_spin.setDecimals(0)
+            self.outlier_value_spin.setRange(0, 9999)
+            self.outlier_value_spin.setValue(10)
+        elif text == "Percentile":
+            self.outlier_value_spin.setSuffix(" %")
+            self.outlier_value_spin.setDecimals(1)
+            self.outlier_value_spin.setRange(0.0, 100.0)
+            self.outlier_value_spin.setValue(5.0)
+        self._on_reanalyze()
+
     def _on_reanalyze(self):
         if self.current_recipe:
             self._run_analysis()
@@ -1915,9 +2073,13 @@ class MainWindow(QMainWindow):
 
         window_size = self.window_spin.value()
         equipment_type = "iso" if self.radio_iso.isChecked() else "dw"
+        outlier_mode = self.outlier_mode_combo.currentText().lower()
+        outlier_value = self.outlier_value_spin.value() if outlier_mode != "none" else 0.0
         self.current_result = analyze_recipe(
             self.current_recipe, window_size=window_size,
-            equipment_type=equipment_type)
+            equipment_type=equipment_type,
+            outlier_mode=outlier_mode,
+            outlier_value=outlier_value)
 
         # Time analysis
         self.current_timing = extract_recipe_timing(self.current_recipe)
@@ -2114,18 +2276,17 @@ class MainWindow(QMainWindow):
         return {}
 
     def _on_res_slider_changed(self, value):
-        """Update label and refresh profile chart when resolution slider changes."""
+        """Update label immediately, debounce chart redraw."""
         if not self.current_recipe:
             return
         if value <= 1:
             self.res_slider_label.setText("Original")
         else:
-            # Compute simulated resolution
             scan_info = self._get_scan_info_dict()
             orig_res = scan_info.get("resolution_nm", 0)
             sim_res = orig_res * value
             self.res_slider_label.setText(f"{sim_res:.0f} nm/px (×{value})")
-        self._update_profile_chart()
+        self._res_debounce.start()
 
     def _update_res_slider_range(self):
         """Update resolution slider range based on current recipe."""
@@ -2165,8 +2326,11 @@ class MainWindow(QMainWindow):
             if idx < len(axes):
                 self._profile_axes_map[id(axes[idx])] = pos
 
-        # Connect double-click (reconnect each time figure is replaced)
-        self.profile_canvas.mpl_connect('button_press_event', self._on_profile_dblclick)
+        # Connect double-click (disconnect old handler first to prevent accumulation)
+        if hasattr(self, '_profile_cid') and self._profile_cid is not None:
+            self.profile_canvas.mpl_disconnect(self._profile_cid)
+        self._profile_cid = self.profile_canvas.mpl_connect(
+            'button_press_event', self._on_profile_dblclick)
 
     def _on_profile_dblclick(self, event):
         """Open Position Detail Dialog on double-click."""

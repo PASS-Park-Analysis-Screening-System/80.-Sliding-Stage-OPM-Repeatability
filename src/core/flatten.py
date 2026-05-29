@@ -226,3 +226,45 @@ def polynomial_flatten(z_data: np.ndarray,
     coefficients = np.polyfit(x_norm, z_data, order)
     regression = np.polyval(coefficients, x_norm)
     return z_data - regression
+
+
+def edge_only_flatten(z_data: np.ndarray,
+                      x_data: Optional[np.ndarray] = None,
+                      order: int = 1,
+                      edge_percent: float = 1.0) -> np.ndarray:
+    """Flatten using edge-only fitting.
+
+    Fits polynomial using ONLY the edge pixels (both ends), then subtracts
+    the regression from the entire profile. This matches the reference tool's
+    leveling method: "양끝 1% 구간만 사용하여 fitting, 원본 전체에서 빼줌".
+
+    Args:
+        z_data: Z values in nm (1D array).
+        x_data: X values (optional, auto-generated if None).
+        order: Polynomial order (default 1 = linear).
+        edge_percent: Percentage of pixels at each end used for fitting (default 1%).
+
+    Returns:
+        Flattened Z values (1D array, same length as input).
+    """
+    n = len(z_data)
+    if x_data is None:
+        x_data = np.arange(n, dtype=np.float64)
+
+    edge_pixels = max(1, int(n * edge_percent / 100.0))
+
+    # Use only edge pixels for fitting
+    x_fit = np.concatenate([x_data[:edge_pixels], x_data[-edge_pixels:]])
+    z_fit = np.concatenate([z_data[:edge_pixels], z_data[-edge_pixels:]])
+
+    # Normalize X for numerical stability
+    x_mean = x_data.mean()
+    x_std = x_data.std()
+    if x_std == 0:
+        x_std = 1.0
+    x_norm = (x_data - x_mean) / x_std
+    x_fit_norm = (x_fit - x_mean) / x_std
+
+    coefficients = np.polyfit(x_fit_norm, z_fit, order)
+    regression = np.polyval(coefficients, x_norm)
+    return z_data - regression
