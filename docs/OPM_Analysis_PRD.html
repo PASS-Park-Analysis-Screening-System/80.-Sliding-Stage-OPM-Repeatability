@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OPM 분석 알고리즘 PRD — Sliding Stage OPM Repeatability</title>
+<style>
+  /* ===== Catppuccin Mocha 팔레트 ===== */
+  :root{
+    --base:#1e1e2e; --mantle:#181825; --crust:#11111b;
+    --surface0:#313244; --surface1:#45475a; --surface2:#585b70;
+    --text:#cdd6f4; --subtext:#a6adc8; --overlay:#6c7086;
+    --blue:#89b4fa; --sapphire:#74c7ec; --teal:#94e2d5; --green:#a6e3a1;
+    --yellow:#f9e2af; --peach:#fab387; --red:#f38ba8; --maroon:#eba0ac;
+    --mauve:#cba6f7; --pink:#f5c2e7; --lavender:#b4befe;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0; background:var(--base); color:var(--text);
+    font-family:"Segoe UI","Malgun Gothic","Apple SD Gothic Neo",sans-serif;
+    font-size:15px; line-height:1.7;
+  }
+  /* 레이아웃: 좌측 고정 TOC + 본문 */
+  .wrap{display:flex; max-width:1400px; margin:0 auto;}
+  nav.toc{
+    width:300px; flex:0 0 300px; position:sticky; top:0; align-self:flex-start;
+    height:100vh; overflow-y:auto; padding:24px 18px; background:var(--mantle);
+    border-right:1px solid var(--surface0); font-size:13.5px;
+  }
+  nav.toc h2{font-size:14px; color:var(--blue); margin:0 0 12px; letter-spacing:.5px;}
+  nav.toc ol{list-style:none; margin:0; padding:0; counter-reset:sec;}
+  nav.toc li{margin:2px 0;}
+  nav.toc a{color:var(--subtext); text-decoration:none; display:block;
+    padding:4px 8px; border-radius:6px; border-left:2px solid transparent;}
+  nav.toc a:hover{background:var(--surface0); color:var(--text); border-left-color:var(--blue);}
+  main{flex:1 1 auto; min-width:0; padding:40px 48px 120px;}
+
+  header.hero{
+    border:1px solid var(--surface0); border-radius:14px; padding:28px 32px;
+    background:linear-gradient(135deg,#1e1e2e 0%,#232336 100%); margin-bottom:36px;
+  }
+  header.hero h1{margin:0 0 6px; font-size:28px; color:var(--lavender);}
+  header.hero .sub{color:var(--subtext); font-size:15px;}
+  .badges{margin-top:16px; display:flex; flex-wrap:wrap; gap:8px;}
+  .badge{font-size:12px; padding:4px 10px; border-radius:20px; background:var(--surface0);
+    color:var(--text); border:1px solid var(--surface1);}
+  .badge.b{border-color:var(--blue); color:var(--blue);}
+  .badge.g{border-color:var(--green); color:var(--green);}
+  .badge.y{border-color:var(--yellow); color:var(--yellow);}
+
+  h2.sec{font-size:22px; color:var(--blue); margin:48px 0 4px; padding-bottom:8px;
+    border-bottom:2px solid var(--surface0); counter-increment:secnum;}
+  h2.sec::before{content:counter(secnum) ". "; color:var(--overlay);}
+  body{counter-reset:secnum;}
+  h3{font-size:17px; color:var(--teal); margin:28px 0 8px;}
+  h4{font-size:15px; color:var(--peach); margin:20px 0 6px;}
+  p{margin:8px 0;}
+  a.inline{color:var(--blue);}
+
+  /* 코드 / 수식 블록 */
+  pre{background:var(--crust); border:1px solid var(--surface0); border-radius:10px;
+    padding:14px 16px; overflow-x:auto; margin:12px 0; font-size:13px; line-height:1.55;}
+  code{font-family:"Cascadia Code","Consolas","D2Coding",monospace;}
+  pre code{color:#cdd6f4;}
+  :not(pre)>code{background:var(--surface0); color:var(--peach); padding:1px 6px;
+    border-radius:5px; font-size:13px;}
+  .formula{background:var(--mantle); border-left:4px solid var(--mauve);
+    border-radius:0 8px 8px 0; padding:12px 18px; margin:12px 0;
+    font-family:"Cascadia Code","Consolas",monospace; font-size:14px; color:var(--lavender);
+    white-space:pre-wrap; overflow-x:auto;}
+  .src{display:inline-block; font-family:"Cascadia Code",monospace; font-size:12px;
+    color:var(--green); background:rgba(166,227,161,.08); border:1px solid rgba(166,227,161,.25);
+    padding:1px 7px; border-radius:5px; margin:2px 0;}
+
+  /* 표 */
+  table{border-collapse:collapse; width:100%; margin:14px 0; font-size:13.5px;}
+  th,td{border:1px solid var(--surface0); padding:7px 10px; text-align:left; vertical-align:top;}
+  th{background:var(--surface0); color:var(--blue); font-weight:600;}
+  tr:nth-child(even) td{background:rgba(49,50,68,.35);}
+  td.num,th.num{text-align:right; font-variant-numeric:tabular-nums;}
+  td.c,th.c{text-align:center;}
+
+  /* 콜아웃 */
+  .callout{border-radius:10px; padding:12px 16px; margin:16px 0; border:1px solid;}
+  .callout .t{font-weight:700; display:block; margin-bottom:4px;}
+  .note{background:rgba(137,180,250,.07); border-color:var(--blue);}
+  .note .t{color:var(--blue);}
+  .warn{background:rgba(249,226,175,.07); border-color:var(--yellow);}
+  .warn .t{color:var(--yellow);}
+  .key{background:rgba(203,166,247,.08); border-color:var(--mauve);}
+  .key .t{color:var(--mauve);}
+  .good{background:rgba(166,227,161,.07); border-color:var(--green);}
+  .good .t{color:var(--green);}
+
+  ul,ol{margin:8px 0; padding-left:24px;}
+  li{margin:4px 0;}
+  .small{font-size:12.5px; color:var(--subtext);}
+  hr{border:none; border-top:1px solid var(--surface0); margin:32px 0;}
+  .pos-grid{display:inline-grid; grid-template-columns:repeat(3,84px); gap:6px; margin:8px 0;}
+  .pos-grid div{background:var(--surface0); border:1px solid var(--surface1); border-radius:6px;
+    text-align:center; padding:8px 0; font-size:13px;}
+  .pos-grid .ctr{border-color:var(--green); color:var(--green);}
+  .pos-grid .side{border-color:var(--yellow); color:var(--yellow);}
+  .pos-grid .edge{border-color:var(--red); color:var(--red);}
+  svg{max-width:100%; height:auto;}
+  .figcap{font-size:12.5px; color:var(--subtext); text-align:center; margin-top:-4px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<!-- ============ TOC ============ -->
+<nav class="toc">
+  <h2>목차 (Contents)</h2>
+  <ol>
+    <li><a href="#s1">개요 — OPM이란 무엇인가</a></li>
+    <li><a href="#s2">파이프라인 한눈에</a></li>
+    <li><a href="#s3">입력 데이터 구조</a></li>
+    <li><a href="#s4">TIFF 디코딩 &amp; 단위 변환</a></li>
+    <li><a href="#s5">데이터 모델</a></li>
+    <li><a href="#s6">전처리 — Flatten &amp; Outlier</a></li>
+    <li><a href="#s7">4대 지표 계산</a></li>
+    <li><a href="#s8">Best-5 윈도우 선정</a></li>
+    <li><a href="#s9">Spec 판정</a></li>
+    <li><a href="#s10">해상도 정규화 / 리샘플</a></li>
+    <li><a href="#s11">비교 분석 (Comparator)</a></li>
+    <li><a href="#s12">QC 6종 검증</a></li>
+    <li><a href="#s13">Ball Screw / Dishing (옵션)</a></li>
+    <li><a href="#s14">시각화 (Charts)</a></li>
+    <li><a href="#s15">검증 기준값 &amp; 재현 방법</a></li>
+    <li><a href="#s16">부록</a></li>
+  </ol>
+  <p class="small" style="margin-top:18px;">문서판 v1.0 · 2026-05-29<br>대상: <code>main.py → src/</code></p>
+</nav>
+
+<!-- ============ MAIN ============ -->
+<main>
+
+<header class="hero">
+  <h1>OPM 분석 알고리즘 PRD</h1>
+  <div class="sub">Sliding Stage OPM Repeatability Analyzer — TIFF 프로파일을 <b>어떻게 불러와 가공·분석하고 그래프로 보여주는지</b>에 대한 단일 권위 기술 문서</div>
+  <div class="badges">
+    <span class="badge b">Park Systems XE</span>
+    <span class="badge">PySide6 + Matplotlib</span>
+    <span class="badge">Catppuccin Mocha</span>
+    <span class="badge g">9-point wafer grid</span>
+    <span class="badge y">TIFF Tag 50434/50435</span>
+    <span class="badge">한국어</span>
+  </div>
+</header>
+
+<div class="callout note">
+  <span class="t">이 문서의 목적</span>
+  기존 <code>docs/algorithm_spec.md</code>·<code>algorithm_comparison_report.md</code>는 "기준 Tool과의 차이/검증"에 초점이 맞춰져 있습니다.
+  이 PRD는 그 공백을 메워, <b>TIFF 로드 → 단위 변환 → 전처리 → 지표 계산 → 시각화</b>의 end-to-end 전 과정을
+  누가 읽어도 이해하고 <b>다른 프로젝트에서 동일하게 재현</b>할 수 있도록 정리합니다. 모든 핵심 로직에는
+  <span class="src">파일:라인</span> 출처를 달아 코드와 1:1 추적이 가능합니다.
+</div>
+
+<!-- ====================== 1. 개요 ====================== -->
+<h2 class="sec" id="s1">개요 — OPM이란 무엇인가</h2>
+
+<p><b>도메인.</b> 이 프로그램은 Park Systems XE 장비의 <b>Sliding Stage</b>(이동 스테이지)가 같은 위치를 반복 측정했을 때
+표면 프로파일이 얼마나 일관되게 재현되는지(<b>반복성, Repeatability</b>)를 정량화합니다. 웨이퍼 위 9개 지점을 N회
+반복 측정한 1차원 높이 프로파일(.tiff)을 입력으로 받습니다.</p>
+
+<p><b>OPM의 정의.</b> OPM(Optical Profiler Measurement)은 한 개 프로파일의 <b>최고점−최저점(Peak-to-Valley)</b>,
+즉 높이 범위(nm)입니다.</p>
+<div class="formula">OPM(nm) = max(z_nm) − min(z_nm)</div>
+<p class="small"><span class="src">src/core/tiff_reader.py:77-79</span> — <code>ProfileData.opm_nm</code> property. 이는 <b>가공 전(raw) 단일 프로파일</b>의 OPM이며, 실제 분석 지표는 Flatten·Outlier 처리 후 재계산됩니다(§6–7).</p>
+
+<h3>4대 핵심 지표 (한 위치 · N repeats 기준)</h3>
+<table>
+  <thead><tr><th>지표</th><th>한 줄 의미</th><th>단위</th></tr></thead>
+  <tbody>
+    <tr><td><b>Rep. Max</b></td><td>같은 위치에서 repeat 간 픽셀별 높이 편차의 <b>최대값</b></td><td>nm</td></tr>
+    <tr><td><b>Rep. 1σ</b></td><td>각 픽셀의 repeat 간 표준편차를 <b>RMS로 집계</b>한 값 (반복성 Spec 판정에 사용)</td><td>nm</td></tr>
+    <tr><td><b>OPM Max</b></td><td>각 repeat의 OPM(Max−Min) 중 <b>최대값</b></td><td>nm</td></tr>
+    <tr><td><b>OPM 1σ</b></td><td>모든 repeat·유효 픽셀 높이값의 <b>zero 기준 RMS</b> (프로파일 형상/Bow의 크기)</td><td>nm</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <span class="t">용어 주의 — 소스 docstring과 실제 구현</span>
+  <code>src/core/analyzer.py</code>의 모듈 docstring(L6–11)은 Rep. 1σ/OPM 1σ를 "OPM의 표준편차"로 적은
+  <b>구버전(v1) 설명</b>이 남아 있습니다. 실제 v2 구현은 본 문서 및 <code>docs/algorithm_spec.md</code>의 정의와 일치합니다
+  (§7에서 코드로 증명). 본 문서는 <b>실제 구현(v2)</b>을 권위 기준으로 삼습니다.
+</div>
+
+<!-- ====================== 2. 파이프라인 ====================== -->
+<h2 class="sec" id="s2">파이프라인 한눈에</h2>
+<p>원시 TIFF 한 장이 최종 그래프/판정에 이르기까지의 전체 흐름입니다. 각 단계의 상세는 해당 섹션에서 다룹니다.</p>
+
+<svg viewBox="0 0 980 520" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#6c7086"/>
+    </marker>
+    <style>
+      .bx{rx:10; stroke-width:1.5;}
+      .lbl{fill:#cdd6f4; font-size:13px; font-weight:600;}
+      .sub{fill:#a6adc8; font-size:10.5px;}
+      .stg{fill:#89b4fa; font-size:11px; font-weight:700;}
+      .ln{stroke:#6c7086; stroke-width:1.5; fill:none;}
+    </style>
+  </defs>
+
+  <!-- Row 1 -->
+  <rect x="20" y="30" width="200" height="64" class="bx" fill="#181825" stroke="#89b4fa"/>
+  <text x="34" y="52" class="stg">① 입력</text>
+  <text x="34" y="70" class="lbl">.tiff 프로파일</text>
+  <text x="34" y="86" class="sub">9-point × N repeats × 4 range</text>
+
+  <rect x="270" y="30" width="200" height="64" class="bx" fill="#181825" stroke="#74c7ec"/>
+  <text x="284" y="52" class="stg">② 폴더/메타 파싱</text>
+  <text x="284" y="70" class="lbl">recipe·repeat·point</text>
+  <text x="284" y="86" class="sub">data_loader.py</text>
+
+  <rect x="520" y="30" width="200" height="64" class="bx" fill="#181825" stroke="#94e2d5"/>
+  <text x="534" y="52" class="stg">③ TIFF 디코딩</text>
+  <text x="534" y="70" class="lbl">Tag 50434 + 50435</text>
+  <text x="534" y="86" class="sub">tiff_reader.py</text>
+
+  <rect x="770" y="30" width="200" height="64" class="bx" fill="#181825" stroke="#a6e3a1"/>
+  <text x="784" y="52" class="stg">④ 물리 단위 변환</text>
+  <text x="784" y="70" class="lbl">x_mm · z_nm</text>
+  <text x="784" y="86" class="sub">DAC → nm (부호 보존)</text>
+
+  <!-- Row 2 -->
+  <rect x="770" y="160" width="200" height="64" class="bx" fill="#181825" stroke="#f9e2af"/>
+  <text x="784" y="182" class="stg">⑤ Flatten</text>
+  <text x="784" y="200" class="lbl">Order-1 Edge-Only</text>
+  <text x="784" y="216" class="sub">양끝 1% fitting → 전체 차감</text>
+
+  <rect x="520" y="160" width="200" height="64" class="bx" fill="#181825" stroke="#fab387"/>
+  <text x="534" y="182" class="stg">⑥ Outlier 제외</text>
+  <text x="534" y="200" class="lbl">pixel Max-Min 기준</text>
+  <text x="534" y="216" class="sub">percentile / pixels</text>
+
+  <rect x="270" y="160" width="200" height="64" class="bx" fill="#181825" stroke="#cba6f7"/>
+  <text x="284" y="182" class="stg">⑦ 4대 지표</text>
+  <text x="284" y="200" class="lbl">Rep.Max·1σ / OPM Max·1σ</text>
+  <text x="284" y="216" class="sub">per position</text>
+
+  <rect x="20" y="160" width="200" height="64" class="bx" fill="#181825" stroke="#f5c2e7"/>
+  <text x="34" y="182" class="stg">⑧ Best-5 윈도우</text>
+  <text x="34" y="200" class="lbl">min(mean Rep.1σ)</text>
+  <text x="34" y="216" class="sub">연속 5-repeat</text>
+
+  <!-- Row 3 -->
+  <rect x="20" y="290" width="200" height="64" class="bx" fill="#181825" stroke="#eba0ac"/>
+  <text x="34" y="312" class="stg">⑨ Spec 판정</text>
+  <text x="34" y="330" class="lbl">DW / ISO</text>
+  <text x="34" y="346" class="sub">Rep.1σ + Max OPM (AND)</text>
+
+  <rect x="270" y="290" width="200" height="64" class="bx" fill="#181825" stroke="#89b4fa"/>
+  <text x="284" y="312" class="stg">⑩ 시각화</text>
+  <text x="284" y="330" class="lbl">6종 Matplotlib 차트</text>
+  <text x="284" y="346" class="sub">plot_manager.py</text>
+
+  <rect x="520" y="290" width="450" height="64" class="bx" fill="#11111b" stroke="#585b70" stroke-dasharray="4 3"/>
+  <text x="534" y="312" class="stg">부가 분석 (옵션)</text>
+  <text x="534" y="330" class="lbl">QC 6종 · Comparator · 해상도 정규화 · Ball Screw</text>
+  <text x="534" y="346" class="sub">qc_checker / comparator / analyzer / ball_screw_analyzer</text>
+
+  <!-- arrows row1 -->
+  <path class="ln" d="M220,62 H270" marker-end="url(#arr)"/>
+  <path class="ln" d="M470,62 H520" marker-end="url(#arr)"/>
+  <path class="ln" d="M720,62 H770" marker-end="url(#arr)"/>
+  <!-- down to row2 -->
+  <path class="ln" d="M870,94 V160" marker-end="url(#arr)"/>
+  <!-- row2 right→left -->
+  <path class="ln" d="M770,192 H720" marker-end="url(#arr)"/>
+  <path class="ln" d="M520,192 H470" marker-end="url(#arr)"/>
+  <path class="ln" d="M270,192 H220" marker-end="url(#arr)"/>
+  <!-- down to row3 -->
+  <path class="ln" d="M120,224 V290" marker-end="url(#arr)"/>
+  <!-- row3 left→right -->
+  <path class="ln" d="M220,322 H270" marker-end="url(#arr)"/>
+  <path class="ln" d="M470,322 H520" marker-end="url(#arr)"/>
+</svg>
+<p class="figcap">그림 1. TIFF → 분석 → 그래프 end-to-end 파이프라인</p>
+
+<!-- ====================== 3. 입력 데이터 구조 ====================== -->
+<h2 class="sec" id="s3">입력 데이터 구조</h2>
+
+<h3>3.1 폴더 레이아웃</h3>
+<pre><code>data/
+└─ {range: 25mm | 10mm | 5mm | 1mm}/      ← Recipe (스캔 범위)
+   └─ {Sample|Lot}{N}/                     ← Repeat (1회 반복 측정)
+      ├─ {prefix}.csv                       ← 측정 메타데이터 (Lot/Sample/Recipe ID)
+      ├─ {prefix}_NNNN_Height.tiff          ← Height 프로파일
+      ├─ {prefix}_NNNN_Z Drive.tiff         ← Z Drive 프로파일
+      └─ Info/{prefix}_Info.csv             ← Point → Position 매핑</code></pre>
+<p class="small">출처 <span class="src">src/core/data_loader.py:6-17</span></p>
+
+<h3>3.2 Recipe 폴더 자동 탐지</h3>
+<p>폴더 이름 어디에든 <code>\d+mm</code> 패턴이 있으면 Recipe로 인식합니다(대소문자 무시, 공백 허용).
+따라서 <code>25mm</code>뿐 아니라 <code>Profile_25mm_Dynamic</code>, <code>25 mm</code>도 모두 25로 해석됩니다.</p>
+<div class="formula">match = re.search(r"(\d+)\s*mm", directory_name, re.IGNORECASE)</div>
+<p class="small">출처 <span class="src">data_loader.py:183-193</span> <code>_detect_range_mm()</code></p>
+<ul>
+  <li><b>탐색 깊이</b>: root(depth 0)부터 <code>max_depth=3</code>까지 재귀. Recipe 폴더를 만나면 추가 후 <b>하위로 더 내려가지 않음</b>(Recipe는 중첩되지 않는다는 가정). <span class="src">data_loader.py:196-219</span></li>
+  <li><b>Repeat 폴더 판별</b>: <code>capture/debug/info/log</code> 이름은 제외하고, <code>*_Height.tiff</code>가 있거나 <code>Info/</code> 하위 폴더가 있는 디렉터리만 Repeat로 채택. <span class="src">data_loader.py:222-236</span></li>
+</ul>
+
+<h3>3.3 9-point 웨이퍼 그리드</h3>
+<p>한 Repeat은 웨이퍼 위 9개 지점을 측정합니다. 라벨과 3×3 그리드 매핑:</p>
+<div class="pos-grid">
+  <div class="edge">1_LT</div><div class="side">2_CT</div><div class="edge">3_RT</div>
+  <div class="side">4_LM</div><div class="ctr">5_CM</div><div class="side">6_RM</div>
+  <div class="edge">7_LB</div><div class="side">8_CB</div><div class="edge">9_RB</div>
+</div>
+<p class="small">
+<span style="color:var(--green)">■ Center</span> = 5_CM ·
+<span style="color:var(--yellow)">■ Side</span> = 2_CT,4_LM,6_RM,8_CB ·
+<span style="color:var(--red)">■ Edge</span> = 1_LT,3_RT,7_LB,9_RB &nbsp;
+(<code>POSITION_LABELS</code>/<code>POSITION_GRID</code> <span class="src">data_loader.py:31-39</span>, <code>POSITION_GROUPS</code> <span class="src">analyzer.py:24-28</span>)</p>
+
+<h3>3.4 Point → Position 매핑 (안정화점 규칙)</h3>
+<p>Info CSV의 Point No로 위치를 결정합니다. <b>Point 1은 안정화(stabilization) 측정</b>이라 분석에서 제외됩니다.</p>
+<table>
+  <thead><tr><th class="c">Point No</th><th>Position</th><th>유효(is_valid)</th></tr></thead>
+  <tbody>
+    <tr><td class="c">1</td><td>1_LT</td><td><b>False</b> (안정화점)</td></tr>
+    <tr><td class="c">2 ~ 10</td><td><code>POSITION_LABELS[point_no − 2]</code> → 1_LT…9_RB</td><td><code>state == "COMPLETED"</code></td></tr>
+    <tr><td class="c">&gt; 10</td><td>P{N}</td><td><code>state == "COMPLETED"</code></td></tr>
+  </tbody>
+</table>
+<p class="small">출처 <span class="src">data_loader.py:142-165</span> (Info CSV 부재 시 TIFF 파일명에서 동일 규칙으로 복원: <span class="src">data_loader.py:262-283</span>)</p>
+
+<!-- ====================== 4. TIFF 디코딩 ====================== -->
+<h2 class="sec" id="s4">TIFF 디코딩 &amp; 단위 변환</h2>
+
+<h3>4.1 Park Systems 커스텀 TIFF 태그</h3>
+<table>
+  <thead><tr><th class="c">Tag</th><th>이름(상수)</th><th>내용</th></tr></thead>
+  <tbody>
+    <tr><td class="c">50434</td><td><code>TAG_RAW_DATA</code></td><td>원시 프로파일 데이터 — <b>float32 × 8192</b> (DAC 단위)</td></tr>
+    <tr><td class="c">50435</td><td><code>TAG_HEADER</code></td><td>바이너리 헤더 — <b>580 bytes</b> (스캔 파라미터)</td></tr>
+    <tr><td class="c">50441</td><td><code>TAG_XML_HEADER</code></td><td>XML 확장 헤더 (현재 미사용)</td></tr>
+  </tbody>
+</table>
+<p class="small">출처 <span class="src">tiff_reader.py:29-32</span>. 이미지(RGB 차트)는 정보용이며 분석에 쓰지 않음.</p>
+<pre><code>raw_data = np.frombuffer(raw_bytes, dtype="&lt;f4").copy()   # little-endian float32</code></pre>
+<p class="small"><span class="src">tiff_reader.py:147</span></p>
+
+<h3>4.2 바이너리 헤더 필드 오프셋 (580 bytes)</h3>
+<table>
+  <thead><tr><th class="num">Offset</th><th>필드</th><th>타입</th><th>의미 / 단위</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0</td><td>version</td><td>int32</td><td>버전</td></tr>
+    <tr><td class="num">4</td><td>source</td><td>UTF-16-LE(32ch)</td><td>신호 채널명 ("Height" / "Z Drive")</td></tr>
+    <tr><td class="num">68</td><td>head_mode</td><td>UTF-16-LE(32ch)</td><td>헤드 모드 (예: "C-AFM")</td></tr>
+    <tr><td class="num">140</td><td>scan_size</td><td>float64</td><td>스캔 크기 — <b>µm</b></td></tr>
+    <tr><td class="num">156 / 164</td><td>xy_offset_x / y</td><td>float64</td><td>XY 오프셋</td></tr>
+    <tr><td class="num">172</td><td>scan_speed</td><td>float64</td><td>스캔 속도 — mm/s</td></tr>
+    <tr><td class="num">180</td><td>set_point</td><td>float64</td><td>Set Point</td></tr>
+    <tr><td class="num">220</td><td><b>z_sensitivity</b></td><td>float64</td><td><b>Z 감도 — meters</b> (부호 포함)</td></tr>
+    <tr><td class="num">228</td><td>z_scale</td><td>float64</td><td>Z 스케일</td></tr>
+    <tr><td class="num">284</td><td>z_servo_gain</td><td>float64</td><td>Z 서보 게인</td></tr>
+  </tbody>
+</table>
+<p class="small">출처 <span class="src">tiff_reader.py:34-45</span>, 파싱 <span class="src">tiff_reader.py:93-115</span> (<code>struct.unpack_from("&lt;d", ...)</code>, UTF-16-LE 디코드 후 NUL 분리)</p>
+
+<h3>4.3 Z축 물리 단위 변환 (DAC → nm)</h3>
+<p>원시값은 20-bit DAC 단위이므로 <code>2²⁰ = 1,048,576</code>로 나눈 뒤 Z 감도(m)와 <code>1e9</code>(m→nm)를 곱합니다.</p>
+<div class="formula">DAC_FULL_SCALE = 2 ** 20  # = 1,048,576
+
+z_nm = raw_data / DAC_FULL_SCALE * z_sensitivity_m * 1e9</div>
+<div class="callout key">
+  <span class="t">부호(sign) 보존이 핵심</span>
+  Z 감도는 <b>부호를 가집니다</b>(Height 채널은 음수). XE Software 규약과 프로파일 방향을 맞추기 위해
+  부호를 그대로 유지합니다. 절댓값을 취하지 않습니다. <span class="src">tiff_reader.py:157-161</span>
+</div>
+
+<h3>4.4 X축 보정 &amp; 해상도</h3>
+<div class="formula">scan_size_mm = scan_size_um / 1000.0
+x_mm = np.linspace(0, scan_size_mm, len(raw_data), endpoint=False)   # 8192 step</div>
+<p class="small"><span class="src">tiff_reader.py:163-165</span></p>
+<p>픽셀 해상도(nm/px)는 분석 시 다음과 같이 계산됩니다:</p>
+<div class="formula">res_nm = scan_size_um * 1000 / pixel_count          # nm/pixel</div>
+<table>
+  <thead><tr><th>Range</th><th class="num">scan_size</th><th class="num">픽셀수</th><th class="num">해상도</th></tr></thead>
+  <tbody>
+    <tr><td>25mm</td><td class="num">25 µm</td><td class="num">8192</td><td class="num">≈ 3.05 nm/px</td></tr>
+    <tr><td>10mm</td><td class="num">10 µm</td><td class="num">8192</td><td class="num">≈ 1.22 nm/px</td></tr>
+    <tr><td>5mm</td><td class="num">5 µm</td><td class="num">8192</td><td class="num">≈ 0.61 nm/px</td></tr>
+    <tr><td>1mm</td><td class="num">1 µm</td><td class="num">8192</td><td class="num">≈ 0.12 nm/px</td></tr>
+  </tbody>
+</table>
+<p class="small">출처 <span class="src">analyzer.py:488</span>. ⚠️ 여기서 "range(25mm…)"는 레시피 이름이며, 헤더의 실제 <code>scan_size</code>(µm)와는 다른 물리 스케일 체계임에 유의.</p>
+
+<!-- ====================== 5. 데이터 모델 ====================== -->
+<h2 class="sec" id="s5">데이터 모델</h2>
+<p>로드 결과는 4단계 계층 dataclass로 메모리에 적재됩니다.</p>
+<div class="formula">DataSet ─┬─ recipes: dict[range_label, RecipeData]
+         │
+RecipeData ─┬─ range_mm, range_label, directory
+            └─ repeats: list[RepeatData]
+                        │
+            RepeatData ─┬─ repeat_no, lot_id, sample_id, recipe_id
+                        ├─ points:   list[PointInfo]
+                        └─ profiles: dict[position, ProfileData]
+                                     │
+                          ProfileData ─ x_mm, z_nm, raw_data, scan_size_um,
+                                        z_sensitivity_m, ... (+ opm_nm, rms_nm)</div>
+
+<table>
+  <thead><tr><th>클래스</th><th>핵심 필드 / 프로퍼티</th><th>출처</th></tr></thead>
+  <tbody>
+    <tr><td><code>ProfileData</code></td><td><code>x_mm, z_nm, raw_data, source, scan_size_um, scan_speed_mm_s, z_sensitivity_m, set_point, z_servo_gain, head_mode, file_path</code> · prop: <code>opm_nm, rms_nm, range_nm, pixel_count, scan_size_mm</code></td><td><span class="src">tiff_reader.py:52-90</span></td></tr>
+    <tr><td><code>PointInfo</code></td><td><code>point_no, x_um, y_um, method_id, state, filename, date, position, is_valid</code></td><td><span class="src">data_loader.py:42-53</span></td></tr>
+    <tr><td><code>RepeatData</code></td><td><code>repeat_no, directory, lot_id, sample_id, recipe_id, points, profiles</code> · prop: <code>valid_points</code></td><td><span class="src">data_loader.py:56-71</span></td></tr>
+    <tr><td><code>RecipeData</code></td><td><code>range_mm, range_label, directory, repeats</code> · prop: <code>repeat_count, position_labels</code></td><td><span class="src">data_loader.py:74-91</span></td></tr>
+    <tr><td><code>DataSet</code></td><td><code>root_directory, recipes</code> · prop: <code>available_ranges</code> (내림차순)</td><td><span class="src">data_loader.py:94-102</span></td></tr>
+  </tbody>
+</table>
+<div class="callout note">
+  <span class="t">로드시 OPM vs 분석시 OPM</span>
+  <code>ProfileData.opm_nm</code>은 <b>가공 전 raw</b> Max−Min입니다(QC-5 이상치 탐지 등에 사용).
+  실제 4대 지표(§7)는 <b>Flatten + Outlier 처리 후</b> 별도로 재계산합니다.
+</div>
+
+<!-- ====================== 6. 전처리 ====================== -->
+<h2 class="sec" id="s6">전처리 — Flatten &amp; Outlier</h2>
+
+<h3>6.1 Order-1 Edge-Only Flatten (분석용 표준)</h3>
+<p>프로파일은 기울어져 있어 분석 전 수평 보정(Flatten)이 필요합니다. 분석의 모든 지표는
+<b>"양끝 1% 픽셀만으로 1차 회귀를 적합하고, 그 회귀선을 전체 구간에서 빼는"</b> 방식을 공통 사용합니다.</p>
+<div class="formula">edge_pixels = max(1, int(N * edge_percent / 100))      # 8192 → 81px (각 끝)
+
+x_fit = concat( x[:edge_pixels], x[-edge_pixels:] )    # 양끝만
+z_fit = concat( z[:edge_pixels], z[-edge_pixels:] )
+
+# 수치 안정화를 위해 x 정규화 후 polyfit
+x_norm     = (x - x.mean()) / x.std()
+coeff      = polyfit(x_fit_norm, z_fit, order=1)
+regression = polyval(coeff, x_norm)
+
+z_flat = z - regression                                # 전체에서 차감</div>
+<p class="small">출처 <span class="src">flatten.py:231-270</span> <code>edge_only_flatten(order=1, edge_percent=1.0)</code></p>
+
+<div class="callout key">
+  <span class="t">왜 "양끝만"인가</span>
+  비유하자면, 자(ruler)의 <b>양쪽 끝만</b> 바닥에 맞추고 가운데는 그대로 두는 방식입니다.
+  전체 구간으로 fitting하면 가운데의 Bow(휨)가 일부 제거되어 버리지만, 양끝 fitting은 <b>Bow를 보존</b>합니다.
+  이것이 연구소 기준 Tool과 결과를 일치시키는 핵심 차이입니다 (PMS Q&amp;A 4249).
+</div>
+
+<div class="callout warn">
+  <span class="t">3종 Flatten 함수를 혼동하지 말 것</span>
+  <table style="margin-top:8px;">
+    <thead><tr><th>함수</th><th>fitting 구간</th><th>주 용도</th></tr></thead>
+    <tbody>
+      <tr><td><code>edge_only_flatten</code></td><td><b>양끝</b> 1%만</td><td>4대 지표 분석 (표준) <span class="src">flatten.py:231</span></td></tr>
+      <tr><td><code>polynomial_flatten</code></td><td>전체 구간</td><td>차트 표시(order 1) · QC-2(order 2) · 해상도 정규화 <span class="src">flatten.py:196</span></td></tr>
+      <tr><td><code>FlattenProcessor.flatten</code></td><td><b>안쪽</b>(양끝 제외) + outlier</td><td>UI Flatten 미리보기(undo/redo) <span class="src">flatten.py:56</span></td></tr>
+    </tbody>
+  </table>
+  ⚠️ <code>FlattenProcessor</code>의 <code>edge_percent</code>는 양끝을 <b>제외</b>하고, <code>edge_only_flatten</code>은 양끝만 <b>사용</b>합니다 — 정반대입니다.
+</div>
+
+<h3>6.2 Outlier Pixel 제외</h3>
+<p>같은 위치를 N번 측정했을 때 특정 픽셀에서 1회만 비정상적으로 큰 값이 나올 수 있습니다.
+이를 <b>repeat 간 Max−Min 범위가 큰 픽셀</b>을 제외해 걸러냅니다.</p>
+<div class="formula">stack       = [z_flat_r1, …, z_flat_rN]          # (repeats, pixels)
+pixel_range = stack.max(axis=0) − stack.min(axis=0)   # (pixels,)
+
+# percentile 모드 (value=5 → 상위 5% 제외)
+threshold  = percentile(pixel_range, 100 − value)
+valid_mask = pixel_range &lt;= threshold
+
+# pixels 모드 (value=10 → 범위 상위 10개 제외)
+valid_mask[ argsort(pixel_range)[-value:] ] = False</div>
+<p class="small">출처 <span class="src">analyzer.py:128-149</span> <code>_exclude_outlier_pixels()</code>. 기본값 <code>mode="none"</code>(제외 없음). 실제 사례: 3_RT/Sample18의 148nm 이상값 1개가 Rep. Max를 6.3배 과대 산출 → outlier 모드로 정상화.</p>
+
+<!-- ====================== 7. 4대 지표 ====================== -->
+<h2 class="sec" id="s7">4대 지표 계산</h2>
+<p>한 위치의 모든 repeat 프로파일을 <code>edge_only_flatten(order=1, 1%)</code>으로 평탄화해 <code>stack (repeats, pixels)</code>로
+쌓고, 유효 픽셀(<code>valid</code>) 마스크를 적용한 뒤 네 지표를 계산합니다. 전체 함수: <span class="src">analyzer.py:152-216</span> <code>_compute_position_result()</code>.</p>
+
+<h3>7.1 Rep. Max</h3>
+<p>픽셀별 repeat 간 높이 편차(범위)의 최대값.</p>
+<div class="formula">pixel_range = stack.max(axis=0) − stack.min(axis=0)
+Rep. Max    = pixel_range[valid].max()</div>
+<p class="small"><span class="src">analyzer.py:178-179</span></p>
+
+<h3>7.2 Rep. 1σ — 반복성 Spec의 핵심</h3>
+<p>각 픽셀에서 repeat 간 표준편차(ddof=0)를 구한 뒤, 그 값들을 <b>RMS로 집계</b>합니다. 단순 <code>std(pixel_range)</code>가 <b>아님</b>에 유의.</p>
+<div class="formula">pixel_stds = stack.std(axis=0, ddof=0)              # 픽셀별 repeat std
+Rep. 1σ    = sqrt( mean( pixel_stds[valid]² ) )    # RMS 집계   (repeats ≥ 2)</div>
+<p class="small"><span class="src">analyzer.py:181-186</span></p>
+
+<h3>7.3 OPM Max</h3>
+<p>각 repeat의 유효 픽셀 Max−Min(=그 repeat의 OPM) 중 최대값.</p>
+<div class="formula">OPM[r]  = stack[r, valid].max() − stack[r, valid].min()
+OPM Max = max_r( OPM[r] )</div>
+<p class="small"><span class="src">analyzer.py:188-199</span></p>
+
+<h3>7.4 OPM 1σ</h3>
+<p>모든 repeat × 유효 픽셀 높이값 전체에 대한 <b>zero 기준 RMS</b>. 평균을 다시 빼지 않으므로 "from zero"이며,
+이는 반복 변동성이 아니라 <b>평탄화된 프로파일 형상(Bow)의 크기</b>를 나타냅니다.</p>
+<div class="formula">all_heights = stack[:, valid].ravel()              # 전체 repeat × 유효 픽셀
+OPM 1σ      = sqrt( mean( all_heights² ) )</div>
+<p class="small"><span class="src">analyzer.py:201-206</span></p>
+
+<table>
+  <thead><tr><th>지표</th><th>수식 요약</th><th>numpy 포인트</th></tr></thead>
+  <tbody>
+    <tr><td>Rep. Max</td><td>max(픽셀별 repeat 범위)</td><td><code>max(axis=0)-min(axis=0)</code>, <code>[valid].max()</code></td></tr>
+    <tr><td>Rep. 1σ</td><td>RMS(픽셀별 repeat std)</td><td><code>std(axis=0, ddof=0)</code> → <code>sqrt(mean(·²))</code></td></tr>
+    <tr><td>OPM Max</td><td>max(repeat별 OPM)</td><td>repeat 루프 <code>max()-min()</code></td></tr>
+    <tr><td>OPM 1σ</td><td>RMS(전체 높이, zero 기준)</td><td><code>ravel()</code> → <code>sqrt(mean(·²))</code></td></tr>
+  </tbody>
+</table>
+<p class="small">결과는 <code>PositionResult</code>에 담깁니다(<code>rep_max, rep_1sigma, opm_max, opm_1sigma, opm_values, repeat_count</code>). <span class="src">analyzer.py:55-64</span></p>
+
+<!-- ====================== 8. Best-5 ====================== -->
+<h2 class="sec" id="s8">Best-5 윈도우 선정</h2>
+<p>N회 반복 중 <b>연속된 5회</b> 구간(window)을 모두 평가한 뒤, <b>평균 Rep. 1σ가 가장 작은</b>(=가장 안정적인) 구간을 선택합니다.
+이 구간이 이후 Spec 판정의 기본 소스가 됩니다.</p>
+<div class="formula">for start in range(n_repeats − window_size + 1):    # window_size = 5
+    window 평가 → 각 위치의 4대 지표 + mean_rep_1sigma
+
+best_window = min(all_windows, key=lambda w: w.mean_rep_1sigma)</div>
+<p class="small">출처 <span class="src">analyzer.py:219-304</span>. <code>WindowResult</code>: <code>start_index, end_index, repeat_range("3-7"), positions, mean_rep_1sigma, max_rep_max, max_opm_max</code> <span class="src">analyzer.py:67-76</span>. repeat 수가 5 미만이면 윈도우 없음 → <code>all_positions</code> 사용.</p>
+
+<!-- ====================== 9. Spec 판정 ====================== -->
+<h2 class="sec" id="s9">Spec 판정</h2>
+<p>장비 타입에 따라 판정 대상이 달라집니다: <b>일체형(DW, Double-Walled)</b> vs <b>분리형(ISO, Isolated)</b>.
+판정 소스는 Best-5 윈도우가 있으면 그 위치들, 없으면 전체 위치입니다. <span class="src">analyzer.py:315-349</span></p>
+
+<h3>9.1 Spec 한계값 (nm)</h3>
+<table>
+  <thead><tr><th>Range</th><th class="num">Rep. 1σ 한계<br>(SPEC_REPEATABILITY)</th><th class="num">Max OPM — DW<br>(일체형)</th><th class="num">Max OPM — ISO<br>(분리형)</th></tr></thead>
+  <tbody>
+    <tr><td>25mm</td><td class="num">12.9</td><td class="num">250.0</td><td class="num">200.0</td></tr>
+    <tr><td>10mm</td><td class="num">5.6</td><td class="num">100.0</td><td class="num">80.0</td></tr>
+    <tr><td>5mm</td><td class="num">3.3</td><td class="num">50.0</td><td class="num">40.0</td></tr>
+    <tr><td>1mm</td><td class="num">1.6</td><td class="num">18.0</td><td class="num">13.0</td></tr>
+  </tbody>
+</table>
+<p class="small">출처 <span class="src">analyzer.py:32-52</span></p>
+
+<h3>9.2 판정 로직</h3>
+<table>
+  <thead><tr><th>판정</th><th>일체형 (dw)</th><th>분리형 (iso)</th></tr></thead>
+  <tbody>
+    <tr><td><b>반복성</b> (Rep. 1σ)</td><td>Center <code>5_CM</code>의 <code>rep_1sigma</code></td><td>전체 위치 <code>rep_1sigma</code>의 <b>RMS</b></td></tr>
+    <tr><td><b>Max OPM</b></td><td>Center <code>5_CM</code>의 <code>opm_max</code></td><td>전체 위치 <code>opm_max</code>의 <b>최대값</b></td></tr>
+  </tbody>
+</table>
+<div class="formula">spec_pass     = (spec_value     &lt;= spec_limit)        # 반복성
+spec_opm_pass = (spec_opm_value &lt;= spec_opm_limit)    # Max OPM
+overall_pass  = spec_pass AND spec_opm_pass            # 둘 다 통과해야 PASS</div>
+<p class="small">출처 <span class="src">analyzer.py:319-349</span>, <code>overall_pass</code> <span class="src">analyzer.py:112-119</span>. 분리형 반복성 RMS: <code>sqrt(mean(sigmas²))</code>.</p>
+
+<!-- ====================== 10. 해상도 정규화 ====================== -->
+<h2 class="sec" id="s10">해상도 정규화 / 리샘플</h2>
+<p>Range마다 픽셀 해상도가 다르므로(§4.4), 서로 다른 Range를 공정하게 비교하려면 공통 해상도로 맞춥니다.
+<b>블록 평균(block-average) 다운샘플</b>을 사용합니다.</p>
+<div class="formula">res_nm  = scan_size_um * 1000 / pixel_count
+factor  = max(1, round(target_res_nm / res_nm))
+
+# block-average 다운샘플
+n_new = len(z) // factor
+z_ds  = z[:n_new*factor].reshape(n_new, factor).mean(axis=1)</div>
+<p class="small">출처 <span class="src">analyzer.py:449-514</span> (<code>resample_profile</code>, <code>compute_normalized_opm</code>). 정규화 OPM은 리샘플 후 <code>polynomial_flatten(order=1)</code>로 레벨링하고 Max−Min을 취함.</p>
+
+<!-- ====================== 11. Comparator ====================== -->
+<h2 class="sec" id="s11">비교 분석 (Comparator)</h2>
+<p>두 분석 결과(현재 vs 기준)를 위치별로 비교해 차이(delta)와 변화율을 계산합니다. 다중 레시피/조건 비교에 사용.</p>
+<ul>
+  <li><b>위치별 delta</b>: <code>rep_max, rep_1sigma, opm_max</code> 각각의 (현재 − 기준)과 OPM Max <b>변화율(%)</b>.</li>
+  <li><b>그룹 요약</b>: <code>POSITION_GROUPS</code>(Center/Side/Edge)별 평균·최대 OPM.</li>
+  <li><b>비교 소스</b>: <code>use_best_window=True</code>면 Best-5 위치, 아니면 전체 위치.</li>
+</ul>
+<p class="small">출처 <span class="src">src/core/comparator.py:49-118</span> <code>compare_results()</code></p>
+
+<!-- ====================== 12. QC ====================== -->
+<h2 class="sec" id="s12">QC 6종 검증</h2>
+<p>로드된 데이터의 무결성을 6가지로 점검합니다. 전체 상태는 <b>하나라도 FAIL이면 FAIL, WARN 있으면 WARN, 아니면 PASS</b>.
+<span class="src">qc_checker.py:75-82</span></p>
+<table>
+  <thead><tr><th class="c">ID</th><th>검사</th><th>기준</th></tr></thead>
+  <tbody>
+    <tr><td class="c">QC-1</td><td>파일 매칭</td><td>Recipe TIFF ↔ <code>Debug/Raw</code>의 동일 파일 존재</td></tr>
+    <tr><td class="c">QC-2</td><td>데이터 등가</td><td>Recipe vs Raw를 <b>Order-2 flatten</b> 후 Range 비교, 허용오차 <b>0.001 nm</b></td></tr>
+    <tr><td class="c">QC-3</td><td>스캔 파라미터 일관성</td><td>z감도·scan size·속도·set point·서보게인이 동일 (<code>rtol=1e-9</code>)</td></tr>
+    <tr><td class="c">QC-4</td><td>위치 완전성</td><td>9 위치 × N repeat 모두 존재하고 <code>state=COMPLETED</code> + TIFF 보유</td></tr>
+    <tr><td class="c">QC-5</td><td>통계 이상치</td><td>OPM이 <b>Median ± 3·MAD</b> 초과 시 WARN (MAD scale <b>1.4826</b>, repeat ≥ 3)</td></tr>
+    <tr><td class="c">QC-6</td><td>픽셀 수</td><td>모든 프로파일이 정확히 <b>8192</b> 픽셀</td></tr>
+  </tbody>
+</table>
+<p class="small">출처 <span class="src">qc_checker.py:56-533</span> (상수 <code>_EXPECTED_PIXELS=8192</code>, <code>_MAD_SCALE=1.4826</code> <span class="src">qc_checker.py:30-34</span>)</p>
+
+<!-- ====================== 13. Ball Screw ====================== -->
+<h2 class="sec" id="s13">Ball Screw / Dishing (옵션)</h2>
+<p>CMP(화학적 기계 연마) 표면 손상 지표인 <b>Dishing/Erosion</b>을 XE의 CMP Percentile 방식으로 계산하는 부가 모듈입니다.</p>
+<div class="formula"># 1) 12차 다항식 flatten (전체 구간)
+flattened = polynomial_flatten(z, order=12)
+
+# 2) Base zone (offset 10%, range 10%) → ErosionTop = 50th pct
+# 3) Interest zone (0~100%)            → DishingTop = 99th, DishingBottom = 1st pct
+Erosion = DishingBottom − ErosionTop      # 음수면 base보다 침식
+Dishing = DishingTop   − DishingBottom</div>
+<p class="small">출처 <span class="src">ball_screw_analyzer.py:116-183</span> <code>compute_dishing()</code>. Spec: AL ≤ 6.0 nm, SUS ≤ 4.5 nm (<code>SPEC_DISHING</code> <span class="src">ball_screw_analyzer.py:34-37</span>), 판정은 repeat 간 <b>MAX Dishing</b> 기준(B-plan).</p>
+<div class="callout warn"><span class="t">코드 vs docstring</span> 모듈 docstring(L11)은 "Erosion = ErosionTop − DishingBottom"으로 적혀 있으나 <b>실제 코드(L180)는 <code>DishingBottom − ErosionTop</code></b>입니다. 본 문서는 실제 코드를 기준으로 합니다.</div>
+
+<!-- ====================== 14. 시각화 ====================== -->
+<h2 class="sec" id="s14">시각화 (Charts)</h2>
+<p>모든 차트는 Matplotlib(Agg 백엔드)로 생성되어 Qt에 임베드되며, Catppuccin Mocha <code>COLORS</code> 팔레트를 사용합니다.
+<span class="src">plot_manager.py:29-45</span></p>
+<table>
+  <thead><tr><th>함수</th><th>차트</th><th>내용</th></tr></thead>
+  <tbody>
+    <tr><td><code>create_profile_overlay_figure</code></td><td>프로파일 오버레이 (3×3)</td><td>위치별로 모든 repeat 프로파일 겹쳐 표시. <b>표시용은 <code>polynomial_flatten(order=1)</code></b>(전체 구간 레벨링) 사용, ~1500점 데시메이션 <span class="src">plot_manager.py:62-139</span></td></tr>
+    <tr><td><code>create_flatten_preview_figure</code></td><td>Flatten 미리보기</td><td>원본 + 평탄화 + 회귀선 + 히스토그램(50 bins) <span class="src">plot_manager.py:173-214</span></td></tr>
+    <tr><td><code>create_saturation_trend_figure</code></td><td>포화(Saturation) 트렌드</td><td>윈도우 시작별 mean Rep. 1σ 추이, Best 윈도우·Spec선 표시 <span class="src">plot_manager.py:217-250</span></td></tr>
+    <tr><td><code>create_wafer_map_figure</code></td><td>웨이퍼 맵 히트맵</td><td>3×3 위치별 지표(<code>opm_max</code> 등) 히트맵, <code>RdYlGn_r</code> <span class="src">plot_manager.py:253-296</span></td></tr>
+    <tr><td><code>create_best5_comparison_figure</code></td><td>Best-5 vs 전체</td><td>위치별 Rep. Max / Rep. 1σ 막대 비교 + Spec선 <span class="src">plot_manager.py:299-356</span></td></tr>
+    <tr><td><code>create_resolution_comparison_figure</code></td><td>해상도 교차 비교</td><td>Range별 원본 vs 정규화 OPM, 감소율(%) 주석 <span class="src">plot_manager.py:359-455</span></td></tr>
+  </tbody>
+</table>
+<p><b>Y축 동기화 모드</b>(<code>_sync_y_axes</code> <span class="src">plot_manager.py:142-170</span>): <code>auto</code>(개별) / <code>unified</code>(전체 동일) / <code>group</code>(그룹별 동일), 패딩 ×1.1.
+<b>해상도 시뮬레이션</b>(<code>sim_factor</code>): 저해상도 가정 시 리샘플 후 표시.</p>
+
+<div class="callout note">
+  <span class="t">진입점: 프로파일 더블클릭 → 상세 다이얼로그</span>
+  3×3 프로파일 차트의 한 subplot을 더블클릭하면 pyqtgraph 기반 <code>PositionDetailDialog</code>(줌/팬/크로스헤어/구간 OPM 측정)가 열립니다.
+  배선: <span class="src">main_window.py:2308-2346</span>. <span class="warn" style="color:var(--yellow)">필수 의존성: <code>pyqtgraph</code>, <code>PyOpenGL</code></span>(미설치 시 더블클릭이 조용히 무반응).
+</div>
+
+<!-- ====================== 15. 검증 ====================== -->
+<h2 class="sec" id="s15">검증 기준값 &amp; 재현 방법</h2>
+<h3>15.1 기준값 (1mm 데이터, Position 1_LT)</h3>
+<p>연구소 기준 Tool과 일치해야 하는 목표값입니다(PMS Q&amp;A 4249).</p>
+<table>
+  <thead><tr><th>지표</th><th class="num">기준 Tool</th><th class="num">v1(이전)</th><th class="num">v2 목표</th></tr></thead>
+  <tbody>
+    <tr><td>Rep. Max</td><td class="num">7.596</td><td class="num">7.595 ✅</td><td class="num">≈ 7.596</td></tr>
+    <tr><td>Rep. 1σ</td><td class="num">1.736</td><td class="num">1.096 ❌ (−37%)</td><td class="num">≈ 1.736</td></tr>
+    <tr><td>OPM Max</td><td class="num">104.788</td><td class="num">102.231 ⚠️</td><td class="num">≈ 104.788</td></tr>
+    <tr><td>OPM 1σ</td><td class="num">67.801</td><td class="num">1.810 ❌ (×37배)</td><td class="num">≈ 67.801</td></tr>
+  </tbody>
+</table>
+<p class="small">출처 <code>docs/algorithm_spec.md</code> §3, <code>algorithm_comparison_report.md</code> §4. 단위 nm.</p>
+
+<h3>15.2 알고리즘 재현 절차 (다른 프로젝트 이식 시)</h3>
+<ol>
+  <li><b>로드</b>: TIFF Tag 50434(float32×8192) + 50435(580B 헤더) 읽기 → §4.3 공식으로 <code>z_nm</code>, §4.4로 <code>x_mm</code> 생성. <b>z 감도 부호 보존</b> 필수.</li>
+  <li><b>평탄화</b>: 각 프로파일에 <code>edge_only_flatten(order=1, edge_percent=1.0)</code> 적용 (§6.1).</li>
+  <li><b>스택 &amp; outlier</b>: 위치별 <code>stack(repeats, pixels)</code> 구성, <code>pixel Max-Min</code> 기준 마스크 (§6.2).</li>
+  <li><b>지표</b>: §7의 4식 그대로 계산 (Rep.1σ·OPM 1σ는 RMS, ddof=0).</li>
+  <li><b>Best-5 / Spec</b>: §8, §9 (장비 타입 dw/iso 분기).</li>
+  <li><b>검증</b>: 위 1mm/1_LT 기준값과 대조 (허용 ±0.01 nm 수준).</li>
+</ol>
+
+<h3>15.3 문서 자체 검증 체크리스트</h3>
+<ul>
+  <li>☐ 이 HTML을 브라우저에서 오프라인으로 열어 스타일·SVG·표가 정상 렌더되는지 확인</li>
+  <li>☐ 외부 리소스(폰트/CDN/이미지) 요청 0건 (개발자 도구 Network 탭)</li>
+  <li>☐ 좌측 TOC 앵커가 모든 섹션으로 정확히 이동</li>
+  <li>☐ 핵심 상수(8192, 2²⁰, 헤더 오프셋, Spec 표)와 수식이 소스와 일치</li>
+</ul>
+
+<!-- ====================== 16. 부록 ====================== -->
+<h2 class="sec" id="s16">부록</h2>
+
+<h3>16.1 상수 / 단위 변환표</h3>
+<table>
+  <thead><tr><th>항목</th><th>값 / 변환</th><th>출처</th></tr></thead>
+  <tbody>
+    <tr><td>DAC full scale</td><td><code>2²⁰ = 1,048,576</code></td><td><span class="src">tiff_reader.py:48-49</span></td></tr>
+    <tr><td>프로파일 픽셀 수</td><td>8192 (고정)</td><td><span class="src">qc_checker.py:31</span></td></tr>
+    <tr><td>헤더 크기</td><td>580 bytes</td><td><span class="src">tiff_reader.py:9</span></td></tr>
+    <tr><td>µm → mm</td><td>÷ 1000</td><td>X축, scan_size</td></tr>
+    <tr><td>µm → nm</td><td>× 1000</td><td>해상도 계산</td></tr>
+    <tr><td>m → nm</td><td>× 1e9</td><td>Z 감도</td></tr>
+    <tr><td>DAC → nm</td><td><code>/ 1,048,576 × z_sens_m × 1e9</code></td><td><span class="src">tiff_reader.py:161</span></td></tr>
+    <tr><td>MAD scale</td><td>1.4826</td><td><span class="src">qc_checker.py:34</span></td></tr>
+    <tr><td>Edge fitting 비율</td><td>1% (각 끝)</td><td><span class="src">analyzer.py:236</span></td></tr>
+    <tr><td>Best 윈도우 크기</td><td>5</td><td><span class="src">analyzer.py:260</span></td></tr>
+  </tbody>
+</table>
+
+<h3>16.2 용어집</h3>
+<table>
+  <thead><tr><th>용어</th><th>설명</th></tr></thead>
+  <tbody>
+    <tr><td>OPM</td><td>Optical Profiler Measurement — 프로파일 Max−Min (nm)</td></tr>
+    <tr><td>Repeatability</td><td>같은 위치를 반복 측정했을 때의 재현성</td></tr>
+    <tr><td>Flatten / Leveling</td><td>기울기·휨 제거를 위한 다항 회귀 차감</td></tr>
+    <tr><td>Bow</td><td>프로파일 가운데가 휜 형상</td></tr>
+    <tr><td>DW / 일체형</td><td>Double-Walled AE — Center(5_CM) 단일 위치로 판정</td></tr>
+    <tr><td>ISO / 분리형</td><td>Isolated AE — 전체 위치 RMS/Max로 판정</td></tr>
+    <tr><td>Best-5</td><td>mean Rep. 1σ가 최소인 연속 5-repeat 구간</td></tr>
+    <tr><td>ddof=0</td><td>모표준편차(N으로 나눔)</td></tr>
+  </tbody>
+</table>
+
+<h3>16.3 핵심 소스 인덱스</h3>
+<table>
+  <thead><tr><th>파일</th><th>역할</th></tr></thead>
+  <tbody>
+    <tr><td><code>src/core/tiff_reader.py</code></td><td>TIFF 디코딩, 단위 변환, <code>ProfileData</code></td></tr>
+    <tr><td><code>src/core/data_loader.py</code></td><td>폴더 탐지, point 매핑, 데이터 모델 계층</td></tr>
+    <tr><td><code>src/core/flatten.py</code></td><td>3종 Flatten (edge-only / polynomial / processor)</td></tr>
+    <tr><td><code>src/core/analyzer.py</code></td><td>4대 지표, Best-5, Spec 판정, 해상도 정규화</td></tr>
+    <tr><td><code>src/core/comparator.py</code></td><td>결과 간 비교(delta, 그룹 요약)</td></tr>
+    <tr><td><code>src/core/qc_checker.py</code></td><td>QC 6종 무결성 검사</td></tr>
+    <tr><td><code>src/core/ball_screw_analyzer.py</code></td><td>Dishing/Erosion(CMP) 분석</td></tr>
+    <tr><td><code>src/visualization/plot_manager.py</code></td><td>6종 Matplotlib 차트 생성</td></tr>
+    <tr><td><code>src/ui/position_detail_dialog.py</code></td><td>pyqtgraph 위치 상세 다이얼로그</td></tr>
+  </tbody>
+</table>
+
+<h3>16.4 변경 이력 (알고리즘)</h3>
+<table>
+  <thead><tr><th>버전</th><th>변경</th></tr></thead>
+  <tbody>
+    <tr><td>v1.0 (2026-03)</td><td>초기 구현 — Rep용 Order-2, OPM용 Order-1, 전체구간 fitting</td></tr>
+    <tr><td>v2.0 (2026-04)</td><td>연구소 답변 반영(PMS Q&amp;A 4249) — Order-1 <b>edge-only</b> flatten, outlier 제외, Rep.1σ·OPM 1σ를 RMS 정의로 변경</td></tr>
+  </tbody>
+</table>
+
+<hr>
+<p class="small">© Sliding Stage OPM Repeatability Analyzer · 본 문서는 코드 기준 자동 추적용 기술 명세입니다.
+관련 문서: <code>docs/algorithm_spec.md</code>, <code>docs/algorithm_comparison_report.md</code>.</p>
+
+</main>
+</div>
+</body>
+</html>
