@@ -23,7 +23,7 @@ import numpy as np
 
 from ..core.data_loader import RecipeData, POSITION_LABELS, POSITION_GRID
 from ..core.analyzer import AnalysisResult, POSITION_GROUPS, resample_profile
-from ..core.flatten import FlattenResult, polynomial_flatten
+from ..core.flatten import FlattenResult, polynomial_flatten, edge_only_flatten
 
 # --- Color Scheme ---
 COLORS = {
@@ -103,13 +103,17 @@ def create_profile_overlay_figure(recipe: RecipeData,
             if pos in repeat.profiles:
                 prof = repeat.profiles[pos]
                 # Apply resampling if simulating lower resolution
+                # Display leveling MUST match the metric leveling (analyzer uses
+                # edge-only Order-1, fit on the outer 1% each end) so the overlay
+                # shapes are consistent with the reported numbers and endpoints
+                # converge to ~0 (matching the reference Tool's view).
                 if sim_factor > 1:
                     z_rs = resample_profile(prof.z_nm, sim_factor)
                     x_rs = resample_profile(prof.x_mm, sim_factor)
-                    z_leveled = polynomial_flatten(z_rs, x_data=x_rs, order=1)
+                    z_leveled = edge_only_flatten(z_rs, order=1, edge_percent=1.0)
                     x_plot = x_rs
                 else:
-                    z_leveled = polynomial_flatten(prof.z_nm, x_data=prof.x_mm, order=1)
+                    z_leveled = edge_only_flatten(prof.z_nm, order=1, edge_percent=1.0)
                     x_plot = prof.x_mm
                 # Decimate for display (min-max preserving)
                 if len(x_plot) > _MAX_DISPLAY_PTS:

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from ..core.data_loader import RecipeData
 from ..core.analyzer import AnalysisResult
+from ..core.flatten import edge_only_flatten
 
 
 # ── pyqtgraph global dark theme ──────────────────────────────
@@ -80,16 +81,22 @@ class PositionDetailDialog(QDialog):
         self.recipe = recipe
         self.result = result
 
-        # Collect profiles for this position
+        # Collect profiles for this position.
+        # Level each curve with the SAME method the analyzer uses (edge-only
+        # Order-1, outer 1% each end) so the displayed curves, per-repeat OPM,
+        # segment measurements and stats are consistent with the analysis table
+        # instead of the raw, unleveled signal.
         self.profiles: list[tuple[int, np.ndarray, np.ndarray, float]] = []
         for repeat in recipe.repeats:
             if position in repeat.profiles:
                 prof = repeat.profiles[position]
+                z_lev = edge_only_flatten(prof.z_nm.astype(np.float64),
+                                          order=1, edge_percent=1.0)
                 self.profiles.append((
                     repeat.repeat_no,
                     prof.x_mm.astype(np.float64),
-                    prof.z_nm.astype(np.float64),
-                    float(prof.opm_nm),
+                    z_lev,
+                    float(z_lev.max() - z_lev.min()),
                 ))
 
         self.setWindowTitle(f"Position Detail — {position}")
@@ -274,13 +281,29 @@ class PositionDetailDialog(QDialog):
         opm_values = np.array([p[3] for p in self.profiles])
         z_arrays = [p[2] for p in self.profiles]
 
-        if len(z_arrays) >= 2:
+        # Prefer the official analysis numbers so this dialog matches the summary
+        # table exactly (same leveling, ddof=1, outlier handling). Fall back to a
+        # consistent local computation (leveled curves, sample stdev) if no result.
+        pr = None
+        if self.result is not None:
+            src = (self.result.best_window.positions
+                   if self.result.best_window else self.result.all_positions)
+            pr = src.get(self.position)
+
+        if pr is not None:
+            rep_max = pr.rep_max
+            rep_1sigma = pr.rep_1sigma
+            opm_max = pr.opm_max
+        elif len(z_arrays) >= 2:
             stack = np.array(z_arrays, dtype=np.float64)
             pixel_range = stack.max(axis=0) - stack.min(axis=0)
             rep_max = float(pixel_range.max())
-            rep_1sigma = float(pixel_range.std(ddof=0))
+            pixel_stds = stack.std(axis=0, ddof=1)  # sample stdev (matches analyzer)
+            rep_1sigma = float(np.sqrt(np.mean(pixel_stds ** 2)))
+            opm_max = float(opm_values.max()) if len(opm_values) else 0.0
         else:
             rep_max = rep_1sigma = 0.0
+            opm_max = float(opm_values.max()) if len(opm_values) else 0.0
 
         mean_z = np.mean(z_arrays, axis=0) if z_arrays else np.array([])
         mean_val = float(mean_z.mean()) if len(mean_z) > 0 else 0.0
@@ -289,7 +312,7 @@ class PositionDetailDialog(QDialog):
         self.summary_label.setText(
             f"<b>Rep. Max:</b> {rep_max:.3f} nm<br>"
             f"<b>Rep. 1\u03c3:</b> {rep_1sigma:.3f} nm<br>"
-            f"<b>OPM Max:</b> {float(opm_values.max()):.3f} nm<br>"
+            f"<b>OPM Max:</b> {opm_max:.3f} nm<br>"
             f"<b>OPM Mean:</b> {float(opm_values.mean()):.3f} nm<br>"
             f"<b>OPM Stdev:</b> {float(opm_values.std(ddof=0)):.3f} nm<br>"
             f"<br>"

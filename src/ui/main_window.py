@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont, QColor, QShortcut, QKeySequence
+from PySide6.QtGui import QFont, QColor, QShortcut, QKeySequence, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
@@ -37,7 +37,9 @@ from ..core.data_loader import (
     load_recipe, load_dataset, DataSet, RecipeData, POSITION_LABELS,
     POSITION_GRID, _detect_range_mm, find_recipe_directories,
 )
-from ..core.analyzer import analyze_recipe, AnalysisResult, get_summary_table
+from ..core.analyzer import (analyze_recipe, AnalysisResult, get_summary_table,
+                             get_dual_summary_table,
+                             ROBUST_OUTLIER_MODE, ROBUST_OUTLIER_VALUE)
 from ..core.qc_checker import run_qc_checks, QCResult
 from ..core.comparator import compare_results, get_compare_table, CompareResult
 from ..core.analyzer import compute_normalized_opm
@@ -185,13 +187,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Sliding Stage OPM Repeatability Analyzer")
-        self.setMinimumSize(1200, 800)
-        self.resize(1440, 900)
+        self.setMinimumSize(1024, 640)
 
         # State
         self.dataset: Optional[DataSet] = None
         self.current_recipe: Optional[RecipeData] = None
         self.current_result: Optional[AnalysisResult] = None
+        self.current_result_robust: Optional[AnalysisResult] = None  # outlier-excluded companion
         self.current_timing: Optional[RecipeTiming] = None
         self.current_bs_result: Optional[BallScrewAnalysisResult] = None
         self.current_qc_result: Optional[QCResult] = None
@@ -203,8 +205,53 @@ class MainWindow(QMainWindow):
         self._loaded_path: Optional[str] = None
         self._block_range_signal = False
 
+        # Debounced re-layout of chart canvases on window resize
+        self._resize_debounce = QTimer()
+        self._resize_debounce.setSingleShot(True)
+        self._resize_debounce.setInterval(150)
+        self._resize_debounce.timeout.connect(self._relayout_visible_canvas)
+
         self._setup_ui()
         self.setStyleSheet(DARK_STYLE)
+        self._fit_to_screen()
+
+    def _fit_to_screen(self):
+        """Open the window at a ratio of the available screen, never exceeding it."""
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(1440, 900)
+            return
+        avail = screen.availableGeometry()
+        min_w, min_h = self.minimumWidth(), self.minimumHeight()
+        # Screen too small even for our minimum → start maximized.
+        if avail.width() < min_w or avail.height() < min_h:
+            self.setWindowState(Qt.WindowMaximized)
+            return
+        w = max(min(int(avail.width() * 0.85), 1600), min_w)
+        h = max(min(int(avail.height() * 0.85), 1000), min_h)
+        self.resize(w, h)
+        self.move(avail.x() + (avail.width() - w) // 2,
+                  avail.y() + (avail.height() - h) // 2)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Debounce: reflow chart labels to the new size after resizing settles.
+        if hasattr(self, "_resize_debounce"):
+            self._resize_debounce.start()
+
+    def _relayout_visible_canvas(self):
+        """Re-run tight_layout + redraw on visible chart canvases so labels reflow."""
+        for name in ("profile_canvas", "trend_canvas", "wafer_canvas",
+                     "best5_canvas", "res_compare_canvas", "flatten_canvas",
+                     "bs_bar_canvas", "bs_heatmap_canvas"):
+            canvas = getattr(self, name, None)
+            if canvas is None or not canvas.isVisible():
+                continue
+            try:
+                canvas.figure.tight_layout()
+            except Exception:
+                pass
+            canvas.draw_idle()
 
     def _setup_ui(self):
         central = QWidget()
@@ -219,9 +266,14 @@ class MainWindow(QMainWindow):
         # Main: Splitter (Settings | Tabs)
         self.main_splitter = QSplitter(Qt.Horizontal)
 
-        # Left: Settings
+        # Left: Settings (scrollable so content never clips on short screens)
         self.settings_widget = self._create_settings_panel()
-        self.main_splitter.addWidget(self.settings_widget)
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setWidget(self.settings_widget)
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.settings_scroll.setFrameShape(QFrame.NoFrame)
+        self.main_splitter.addWidget(self.settings_scroll)
 
         # Right: Category Tabs (2-level nested QTabWidget)
         self.tabs = QTabWidget()
@@ -236,7 +288,7 @@ class MainWindow(QMainWindow):
 
         # Create all tab widgets first
         self.profile_canvas = FigureCanvas(Figure(figsize=(12, 9)))
-        self.summary_table = self._create_summary_table()
+        self.summary_tab = self._create_summary_table()  # sets self.summary_table (inner)
         self.flatten_widget = self._create_flatten_tab()
         self.trend_canvas = FigureCanvas(Figure(figsize=(10, 6)))
         self.wafer_canvas = FigureCanvas(Figure(figsize=(8, 7)))
@@ -303,7 +355,7 @@ class MainWindow(QMainWindow):
         self.analysis_tabs = QTabWidget()
         self.analysis_tabs.setStyleSheet(_inner_tab_style)
         self.analysis_tabs.addTab(self.profile_tab_widget, "Profile Charts")
-        self.analysis_tabs.addTab(self.summary_table, "Summary Table")
+        self.analysis_tabs.addTab(self.summary_tab, "Summary Table")
         self.analysis_tabs.addTab(self.flatten_widget, "Flatten")
         self.analysis_tabs.addTab(self.bs_widget, "Ball Screw Pitch")
 
@@ -355,7 +407,7 @@ class MainWindow(QMainWindow):
     def _toggle_side_panel(self):
         """Toggle left settings panel visibility (F11)."""
         self._side_panel_visible = not self._side_panel_visible
-        self.settings_widget.setVisible(self._side_panel_visible)
+        self.settings_scroll.setVisible(self._side_panel_visible)
         if self._side_panel_visible:
             self.main_splitter.setSizes([260, 1000])
             self.statusBar().showMessage("Side panel shown (F11)", 2000)
@@ -380,8 +432,7 @@ class MainWindow(QMainWindow):
 
     def _create_settings_panel(self) -> QWidget:
         widget = QWidget()
-        widget.setMinimumWidth(260)
-        widget.setMaximumWidth(260)
+        widget.setMinimumWidth(240)
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
@@ -447,8 +498,11 @@ class MainWindow(QMainWindow):
         outlier_inner.setContentsMargins(10, 6, 10, 8)
         outlier_inner.setSpacing(4)
 
-        outlier_title = QLabel("Outlier Exclusion")
+        outlier_title = QLabel("Robust 제외 (Raw와 병기)")
         outlier_title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 12px;")
+        outlier_title.setToolTip(
+            "Raw(전체 데이터)는 항상 표시되고, 여기서 고른 제외 방식으로 계산한 "
+            "Robust 값이 Summary/Spec에 함께 표시됩니다. None이면 Robust 열 없음.")
         outlier_inner.addWidget(outlier_title)
 
         outlier_row1 = QHBoxLayout()
@@ -481,6 +535,10 @@ class MainWindow(QMainWindow):
         outlier_row2.addWidget(self.outlier_value_spin)
         outlier_row2.addStretch()
         outlier_inner.addLayout(outlier_row2)
+
+        # Default to Percentile 1% to match the reference Tool, which always
+        # excludes outlier pixels (analyzer.DEFAULT_OUTLIER_MODE/VALUE).
+        self.outlier_mode_combo.setCurrentText("Percentile")
 
         layout.addWidget(outlier_frame)
 
@@ -607,7 +665,7 @@ class MainWindow(QMainWindow):
 
         return widget
 
-    def _create_summary_table(self) -> QTableWidget:
+    def _create_summary_table(self) -> QWidget:
         table = QTableWidget()
         table.setColumnCount(6)
         table.setHorizontalHeaderLabels([
@@ -616,14 +674,30 @@ class MainWindow(QMainWindow):
         ])
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         table.setAlternatingRowColors(True)
+        table.setWordWrap(True)
         # Bigger font for readability
         table.setStyleSheet("""
             QTableWidget { font-size: 13px; }
             QTableWidget::item { padding: 6px; }
             QHeaderView::section { font-size: 13px; padding: 8px; }
         """)
-        table.verticalHeader().setDefaultSectionSize(32)
-        return table
+        # Taller rows so each metric cell can show two lines (raw / robust).
+        table.verticalHeader().setDefaultSectionSize(46)
+        self.summary_table = table
+
+        # Wrap with a legend so the raw/robust dual display is self-explanatory.
+        container = QWidget()
+        v = QVBoxLayout(container)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        legend = QLabel(
+            "각 지표 칸 — 상단: <b>Raw</b>(전체 데이터, 참 측정값) · 하단: "
+            "<b>Robust</b>(outlier 제외). 두 값이 다른 칸은 노랑으로 강조됩니다.")
+        legend.setWordWrap(True)
+        legend.setStyleSheet("color:#a6adc8; font-size:11px; padding:3px 6px;")
+        v.addWidget(legend)
+        v.addWidget(table)
+        return container
 
     def _create_flatten_tab(self) -> QWidget:
         """Flatten tab — single row controls for maximum chart space."""
@@ -2058,7 +2132,7 @@ class MainWindow(QMainWindow):
             self.outlier_value_spin.setSuffix(" %")
             self.outlier_value_spin.setDecimals(1)
             self.outlier_value_spin.setRange(0.0, 100.0)
-            self.outlier_value_spin.setValue(5.0)
+            self.outlier_value_spin.setValue(1.0)
         self._on_reanalyze()
 
     def _on_reanalyze(self):
@@ -2073,13 +2147,23 @@ class MainWindow(QMainWindow):
 
         window_size = self.window_spin.value()
         equipment_type = "iso" if self.radio_iso.isChecked() else "dw"
-        outlier_mode = self.outlier_mode_combo.currentText().lower()
-        outlier_value = self.outlier_value_spin.value() if outlier_mode != "none" else 0.0
+        # Raw = the true measurement (no outlier exclusion) — the honest headline
+        # used by all charts / wafer map / detail dialog.
         self.current_result = analyze_recipe(
             self.current_recipe, window_size=window_size,
             equipment_type=equipment_type,
-            outlier_mode=outlier_mode,
-            outlier_value=outlier_value)
+            outlier_mode="none", outlier_value=0.0)
+        # Robust companion = outlier-excluded preset from the UI (default Percentile
+        # 1%), shown ALONGSIDE the raw value. "None" -> no companion (mirrors raw).
+        robust_mode = self.outlier_mode_combo.currentText().lower()
+        if robust_mode == "none":
+            self.current_result_robust = None
+        else:
+            self.current_result_robust = analyze_recipe(
+                self.current_recipe, window_size=window_size,
+                equipment_type=equipment_type,
+                outlier_mode=robust_mode,
+                outlier_value=self.outlier_value_spin.value())
 
         # Time analysis
         self.current_timing = extract_recipe_timing(self.current_recipe)
@@ -2146,31 +2230,49 @@ class MainWindow(QMainWindow):
             plt.close(old_fig)
         new_fig.set_canvas(canvas)
         canvas.figure = new_fig
-        new_fig.set_dpi(canvas.figure.get_dpi())
+        # Sync DPI to the canvas' logical DPI → point-sized fonts render at a
+        # consistent physical size across displays with different scaling.
+        target_dpi = canvas.logicalDpiX() or new_fig.get_dpi()
+        new_fig.set_dpi(target_dpi)
         w, h = canvas.width(), canvas.height()
         if w > 0 and h > 0:
-            new_fig.set_size_inches(w / new_fig.get_dpi(), h / new_fig.get_dpi())
+            new_fig.set_size_inches(w / target_dpi, h / target_dpi)
         canvas.draw_idle()
         canvas.update()
 
     def _update_summary_table(self):
         if not self.current_result:
             return
-        rows = get_summary_table(self.current_result, use_best_window=True)
+        rows = get_dual_summary_table(
+            self.current_result, self.current_result_robust, use_best_window=True)
         self.summary_table.setRowCount(len(rows))
+        metric_keys = ["Rep. Max (nm)", "Rep. 1σ (nm)", "OPM Max (nm)", "OPM 1σ (nm)"]
+        cols = ["Range", "Position"] + metric_keys
         for i, row in enumerate(rows):
-            for j, key in enumerate(["Range", "Position", "Rep. Max (nm)",
-                                      "Rep. 1σ (nm)", "OPM Max (nm)", "OPM 1σ (nm)"]):
-                val = row.get(key, "")
-                item = QTableWidgetItem(str(val))
+            is_total = row.get("Range") == "Total"
+            is_group = row.get("Range") == "Group"
+            for j, key in enumerate(cols):
+                differ = False
+                if key in metric_keys:
+                    raw = row.get(key, "")
+                    rob = row.get(f"{key} (rob)", raw)
+                    # Show raw on top and robust below only where they differ.
+                    differ = (self.current_result_robust is not None
+                              and rob != "-" and str(rob) != str(raw))
+                    text = f"{raw}\n{rob}" if differ else f"{raw}"
+                else:
+                    text = str(row.get(key, ""))
+                item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignCenter)
-                if row.get("Range") == "Total":
+                if is_total:
                     item.setBackground(QColor("#313244"))
                     item.setFont(QFont("Segoe UI", 11, QFont.Bold))
-                elif row.get("Range") == "Group":
+                elif is_group:
                     item.setBackground(QColor("#1e1e2e"))
                     item.setForeground(QColor("#f9e2af"))
                     item.setFont(QFont("Segoe UI", 11, QFont.Bold))
+                if differ and not is_group:
+                    item.setForeground(QColor("#f9e2af"))  # raw≠robust -> highlight
                 self.summary_table.setItem(i, j, item)
 
     def _update_spec_display(self):
@@ -2189,18 +2291,37 @@ class MainWindow(QMainWindow):
         if r.best_window:
             lines.append(f"<b>Window:</b> R{r.best_window.repeat_range}")
 
-        # OPM Repeatability
+        rr = self.current_result_robust  # outlier-excluded companion (may be None)
+
+        # OPM Repeatability (Rep. 1\u03c3) \u2014 raw, with robust shown alongside
         if r.spec_limit is not None:
             val_str = f"{r.spec_value:.3f}" if r.spec_value is not None else "N/A"
             pass_icon = "\u2705" if r.spec_pass else "\u274c"
-            lines.append(f"")
-            lines.append(f"{pass_icon} <b>Rep. 1\u03c3:</b> {val_str} / {r.spec_limit} nm")
+            line = f"{pass_icon} <b>Rep. 1\u03c3:</b> {val_str} / {r.spec_limit} nm"
+            if rr is not None and rr.spec_value is not None:
+                rob_icon = "\u2705" if rr.spec_pass else "\u274c"
+                line += (f"  <span style='color:#a6adc8'>(robust {rob_icon} "
+                         f"{rr.spec_value:.3f})</span>")
+            lines.append("")
+            lines.append(line)
 
-        # Max OPM
+        # Max OPM \u2014 raw, with robust shown alongside
         if r.spec_opm_limit is not None:
             val_str = f"{r.spec_opm_value:.3f}" if r.spec_opm_value is not None else "N/A"
             pass_icon = "\u2705" if r.spec_opm_pass else "\u274c"
-            lines.append(f"{pass_icon} <b>OPM Max:</b> {val_str} / {r.spec_opm_limit} nm")
+            line = f"{pass_icon} <b>OPM Max:</b> {val_str} / {r.spec_opm_limit} nm"
+            if rr is not None and rr.spec_opm_value is not None:
+                rob_icon = "\u2705" if rr.spec_opm_pass else "\u274c"
+                line += (f"  <span style='color:#a6adc8'>(robust {rob_icon} "
+                         f"{rr.spec_opm_value:.3f})</span>")
+            lines.append(line)
+
+        # Flag when raw vs robust verdict disagrees (= an outlier flipped the result).
+        if rr is not None and r.overall_pass is not None and rr.overall_pass is not None \
+                and r.overall_pass != rr.overall_pass:
+            lines.append("")
+            lines.append("<span style='color:#f9e2af'>\u26a0 Raw/Robust \ud310\uc815 \ubd88\uc77c\uce58 "
+                         "\u2014 outlier \uc601\ud5a5 (QC-5 \ud655\uc778)</span>")
 
         self.spec_lines_label.setText("<br>".join(lines))
 
@@ -2679,9 +2800,11 @@ class MainWindow(QMainWindow):
         base = Path(folder)
         rl = self.current_result.range_label
         try:
-            export_summary_csv(self.current_result, base / f"summary_{rl}.csv")
+            export_summary_csv(self.current_result, base / f"summary_{rl}.csv",
+                               robust_result=self.current_result_robust)
             export_avg_line_csv(self.current_recipe, base / f"avg_lines_{rl}.csv")
-            export_checklist(self.current_result, base / f"checklist_{rl}.txt")
+            export_checklist(self.current_result, base / f"checklist_{rl}.txt",
+                             robust_result=self.current_result_robust)
 
             for name, canvas in [("profiles", self.profile_canvas),
                                   ("trend", self.trend_canvas),
@@ -2708,7 +2831,12 @@ class MainWindow(QMainWindow):
 
 def run_app():
     """Launch the application."""
+    # High-DPI rounding policy must be set before the QApplication is constructed.
+    if QApplication.instance() is None:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication.instance() or QApplication(sys.argv)
+    app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app.setFont(QFont("Segoe UI", 10))
 
     window = MainWindow()

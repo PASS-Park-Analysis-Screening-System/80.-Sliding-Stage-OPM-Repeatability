@@ -489,8 +489,9 @@ Rep. Max    = pixel_range[valid].max()</div>
 
 <h3>7.2 Rep. 1σ — 반복성 Spec의 핵심</h3>
 <p>각 픽셀에서 repeat 간 표준편차(ddof=0)를 구한 뒤, 그 값들을 <b>RMS로 집계</b>합니다. 단순 <code>std(pixel_range)</code>가 <b>아님</b>에 유의.</p>
-<div class="formula">pixel_stds = stack.std(axis=0, ddof=0)              # 픽셀별 repeat std
+<div class="formula">pixel_stds = stack.std(axis=0, ddof=1)              # 픽셀별 repeat 표본표준편차
 Rep. 1σ    = sqrt( mean( pixel_stds[valid]² ) )    # RMS 집계   (repeats ≥ 2)</div>
+<p class="small"><b>ddof=1</b>(표본표준편차): N=5 재현성의 불편추정량이며 기준 Tool과 정합. ddof=0은 σ를 ~12% 과소평가.</p>
 <p class="small"><span class="src">analyzer.py:181-186</span></p>
 
 <h3>7.3 OPM Max</h3>
@@ -510,7 +511,7 @@ OPM 1σ      = sqrt( mean( all_heights² ) )</div>
   <thead><tr><th>지표</th><th>수식 요약</th><th>numpy 포인트</th></tr></thead>
   <tbody>
     <tr><td>Rep. Max</td><td>max(픽셀별 repeat 범위)</td><td><code>max(axis=0)-min(axis=0)</code>, <code>[valid].max()</code></td></tr>
-    <tr><td>Rep. 1σ</td><td>RMS(픽셀별 repeat std)</td><td><code>std(axis=0, ddof=0)</code> → <code>sqrt(mean(·²))</code></td></tr>
+    <tr><td>Rep. 1σ</td><td>RMS(픽셀별 repeat 표본std)</td><td><code>std(axis=0, ddof=1)</code> → <code>sqrt(mean(·²))</code></td></tr>
     <tr><td>OPM Max</td><td>max(repeat별 OPM)</td><td>repeat 루프 <code>max()-min()</code></td></tr>
     <tr><td>OPM 1σ</td><td>RMS(전체 높이, zero 기준)</td><td><code>ravel()</code> → <code>sqrt(mean(·²))</code></td></tr>
   </tbody>
@@ -647,6 +648,16 @@ Dishing = DishingTop   − DishingBottom</div>
   </tbody>
 </table>
 <p class="small">출처 <code>docs/algorithm_spec.md</code> §3, <code>algorithm_comparison_report.md</code> §4. 단위 nm.</p>
+
+<div class="callout warn">
+  <span class="t">알려진 한계 &amp; 기본값 (최종 검수 v2.1)</span>
+  <ul style="margin:6px 0;">
+    <li><b>Rep. 1σ</b>는 <code>ddof=1</code>(표본표준편차) — N=5 불편추정량, 기준 Tool 정합. ddof=0은 σ를 ~12% 과소평가.</li>
+    <li><b>Outlier — Raw + Robust 병기</b>: 모든 지표를 Raw(전체)와 Robust(outlier 제외, 기본 Percentile 1%) 두 값으로 함께 표시(Summary/Spec/CSV). Raw가 headline, QC-5가 outlier 별도 WARN, 판정 불일치 시 경고. 상수 <code>analyzer.ROBUST_OUTLIER_MODE/VALUE</code>.</li>
+    <li><b>OPM Max ~4~5% intrinsic 잔차</b> — 기준값이 데이터 raw P-V보다 높아 재현 불가(z_scale=1.0, 알고리즘 오류 아님). AFP 변환식 확보 시에만 정합.</li>
+    <li>회귀 점검: <code>python scripts/validate_against_reference.py</code> (OPM Max는 intrinsic 분류).</li>
+  </ul>
+</div>
 
 <h3>15.2 알고리즘 재현 절차 (다른 프로젝트 이식 시)</h3>
 <ol>

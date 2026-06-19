@@ -3,12 +3,15 @@
 Calculates OPM, Repeatability statistics, Best-5 Window selection,
 and Spec pass/fail judgment.
 
-Key Metrics:
-    - OPM:  Max - Min of a single profile (nm)
-    - Rep. Max:  Maximum OPM across repeats for a position
-    - Rep. 1σ:   Standard deviation of OPM across repeats for a position
-    - OPM Max:   Maximum of averaged profile's range across repeats
-    - OPM 1σ:    Standard deviation of averaged profile range across repeats
+All metrics use a common Order-1 edge-only (outer 1%) LS flatten and pixel-wise
+outlier exclusion (PMS Q&A 4249). See docs/algorithm_spec.md.
+
+Key Metrics (per position, across N repeats, on valid pixels):
+    - OPM:      Max - Min of a single profile (nm)
+    - Rep. Max: Max over pixels of the repeat-to-repeat range (Max-Min)
+    - Rep. 1σ:  RMS over pixels of the per-pixel repeat sample-stdev (ddof=1)
+    - OPM Max:  Max over repeats of that repeat's OPM (Max-Min)
+    - OPM 1σ:   RMS-from-zero of all repeat x valid-pixel heights (profile/Bow size)
 """
 from __future__ import annotations
 
@@ -50,6 +53,16 @@ SPEC_MAX_OPM_ISO = {   # Isolated AE
     5: 40.0,
     1: 13.0,
 }
+
+# Robust-analysis outlier preset (shown ALONGSIDE the raw result, not instead of).
+# The tool presents two numbers per metric: the raw value (no exclusion = the true
+# measurement, the honest QC headline) and a robust value computed with this preset
+# (outlier pixels excluded). QC-5 (Median ± 3·MAD) independently flags gross
+# outliers, so nothing is silently hidden. The preset is tunable in the UI.
+# NOTE: percentile 1% is a mild, scale-invariant default; the exact value is a
+# policy choice, not a reproduction of the (undocumented) legacy AFP threshold.
+ROBUST_OUTLIER_MODE = "percentile"
+ROBUST_OUTLIER_VALUE = 1.0
 
 
 @dataclass
@@ -178,9 +191,11 @@ def _compute_position_result(position: str,
     pixel_range = stack.max(axis=0) - stack.min(axis=0)  # (pixels,)
     rep_max = float(pixel_range[valid].max()) if has_valid else 0.0
 
-    # Rep. 1σ: RMS of per-pixel repeat stdev on valid pixels
+    # Rep. 1σ: RMS of per-pixel repeat stdev on valid pixels.
+    # ddof=1 (sample stdev, ÷N-1) matches the reference Tool and is the unbiased
+    # estimator for the small repeat count (N=5); ddof=0 under-reports σ by ~12%.
     if stack.shape[0] >= 2 and has_valid:
-        pixel_stds = stack.std(axis=0, ddof=0)  # std across repeats per pixel
+        pixel_stds = stack.std(axis=0, ddof=1)  # sample std across repeats per pixel
         rep_1sigma = float(np.sqrt(np.mean(pixel_stds[valid] ** 2)))
     else:
         rep_1sigma = 0.0
@@ -440,6 +455,34 @@ def get_summary_table(result: AnalysisResult,
                       "OPM 1σ (nm)": round(float(np.mean(opm_sigmas)), 3)})
 
     return rows
+
+
+def get_dual_summary_table(raw_result: AnalysisResult,
+                           robust_result: Optional[AnalysisResult] = None,
+                           use_best_window: bool = True) -> list[dict]:
+    """Summary rows carrying BOTH raw and robust (outlier-excluded) metrics.
+
+    Each row holds the raw metric values plus parallel "<metric> (rob)" keys
+    sourced from robust_result, aligned by (Range, Position). When robust_result
+    is None the robust keys mirror the raw values (no exclusion applied).
+
+    Used by the UI/exports to present the true measurement and the robust value
+    side by side, rather than silently trimming outliers.
+    """
+    raw_rows = get_summary_table(raw_result, use_best_window=use_best_window)
+    rob_rows = (get_summary_table(robust_result, use_best_window=use_best_window)
+                if robust_result is not None else raw_rows)
+    rob_index = {(r["Range"], r["Position"]): r for r in rob_rows}
+
+    metric_keys = ["Rep. Max (nm)", "Rep. 1σ (nm)", "OPM Max (nm)", "OPM 1σ (nm)"]
+    merged = []
+    for row in raw_rows:
+        out = dict(row)
+        rob = rob_index.get((row["Range"], row["Position"]), row)
+        for k in metric_keys:
+            out[f"{k} (rob)"] = rob.get(k, row.get(k))
+        merged.append(out)
+    return merged
 
 
 # ---------------------------------------------------------------------------

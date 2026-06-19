@@ -17,7 +17,7 @@
 5. **Skill-First**: 코드 작성 전 `.agent/skills/registry.json`에서 관련 skill을 검색하고, 해당 SKILL.md의 패턴을 따를 것
 
 ## Skills Reference
-- **Registry**: `.agent/skills/registry.json` (17개 skill, tags/dependencies/source_files 포함)
+- **Registry**: `.agent/skills/registry.json` (tags/dependencies/source_files 포함). 현재 실제 구현된 skill: **17 Cross-Display Optimization** (그 외 표의 항목은 카탈로그 상의 참고용)
 - **한국어 skill**: `.agent/skills/skills-ko/{폴더명}/SKILL.md`
 - **영문 skill**: `.agent/skills/skills-en/{폴더명}/SKILL.md`
 
@@ -30,3 +30,4 @@
 | 11 | 커스텀 위젯 | UI 컴포넌트 패턴 |
 | 14 | 설정 관리 | 설정 저장/로드 |
 | 16 | 검증 QA | 작업 완료 후 검증 체크리스트 |
+| 17 | Cross-Display Optimization | 디스플레이/High-DPI 대응 (노트북·모니터·고DPI) — ✅ registry에 실제 구현됨 |

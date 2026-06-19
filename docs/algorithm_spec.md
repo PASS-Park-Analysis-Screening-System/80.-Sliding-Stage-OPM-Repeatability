@@ -76,11 +76,15 @@ Rep. Max = max(pixel_range[valid_pixels])
 **의미**: 각 pixel에서 repeat간 표준편차의 RMS 집계
 
 ```
-pixel_std[i] = std(z_flat[:, i], ddof=0)    # 각 유효 pixel i에서 repeat간 std
+pixel_std[i] = std(z_flat[:, i], ddof=1)    # 각 유효 pixel i에서 repeat간 표본표준편차
 Rep. 1σ = sqrt(mean(pixel_std[valid_pixels]²))   # RMS 집계
 ```
 
 **주의**: `std(pixel_range)`가 아님. pixel별 repeat std → RMS.
+
+**ddof=1 (표본표준편차)**: repeat 수 N=5에서 불편추정량이며 기준 Tool과 정합. `ddof=0`(모표준편차)은
+재현성을 약 12% 과소평가하여 낙관적 판정(기준이 FAIL할 것을 PASS) 위험이 있어 사용하지 않음.
+검증: ddof=0 → 기준 대비 −14%, ddof=1 → −3.6% (data/25mm 4개 Position 평균).
 
 ### 2-3. OPM Max (Optical Profiler Measurement Maximum)
 
@@ -141,9 +145,28 @@ OPM 1σ = sqrt(mean(all_heights²))                          # RMS from zero
 
 ---
 
-## 5. 변경 이력
+## 5. 기본값 및 검증 한계
+
+### 5-1. Outlier 처리 — Raw + Robust 병기
+참 측정값을 숨기지 않기 위해, 모든 지표를 **Raw(전체 데이터, outlier 미제외)**와
+**Robust(outlier 제외, 기본 Percentile 1%)** 두 값으로 **함께** 제시한다(Summary 테이블·Spec·CSV).
+- Raw가 headline(차트/상세/판정 기본), Robust는 동반 표시. UI "Robust 제외" 선택으로 방식/threshold 조정,
+  None이면 Robust 생략. 상수: `analyzer.ROBUST_OUTLIER_MODE/VALUE`.
+- QC-5(Median±3·MAD)가 outlier를 독립 WARN → 은폐 없음. Raw/Robust 판정 불일치 시 Spec 패널이 경고.
+- 효과: 불량 repeat(3_RT/Sample18 148nm) 시 Raw RepMax **62.8** / Robust **9.4**가 나란히 보여, 차이의
+  원인(outlier)을 근거와 함께 제시 가능.
+- Percentile 1%는 완만·scale-invariant 기본값(정책 선택) — 레거시 AFP threshold 재현이 목적 아님.
+
+### 5-2. OPM Max 잔차 (~4~5%, intrinsic)
+OPM Max는 기준 Tool 값이 **제공된 TIFF의 raw peak-to-valley보다도 높아**(예: 1_LT 기준 104.788 > raw 101.2)
+어떤 leveling으로도 재현 불가하다(두 데이터셋 확증, z_scale=1.0로 단순 스케일 버그 아님). OPM 1σ 등은 정합하므로
+알고리즘 오류가 아니라 2021 AFP Tool의 DAC→nm 변환/데이터 인스턴스 차이로 판단하며, 닫으려면 AFP 변환식이 필요하다.
+회귀 점검은 `scripts/validate_against_reference.py`로 수행(OPM Max는 intrinsic으로 분류).
+
+## 6. 변경 이력
 
 | 버전 | 날짜 | 변경 내용 |
 |------|------|-----------|
 | v1.0 | 2026-03 | 초기 구현 (Order-2 flatten for Rep, Order-1 for OPM, 전체구간 fitting) |
 | v2.0 | 2026-04 | 연구소 답변 기반 수정_PMS: Q&A 4249 (Order-1 edge-only flatten, outlier exclusion, 공식 변경) |
+| v2.1 | 2026-06 | 최종 검수: Rep.1σ ddof=1(표본), Outlier Raw+Robust 병기 표시, 표시/상세 leveling 일치, 검증 하니스 추가 |

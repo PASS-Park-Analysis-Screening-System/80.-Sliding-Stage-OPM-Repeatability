@@ -13,14 +13,23 @@ from typing import Optional
 
 import numpy as np
 
-from ..core.analyzer import AnalysisResult, get_summary_table
+from ..core.analyzer import AnalysisResult, get_summary_table, get_dual_summary_table
 from ..core.data_loader import RecipeData, POSITION_LABELS
 
 
 def export_summary_csv(result: AnalysisResult, output_path: str | Path,
-                       use_best_window: bool = True) -> None:
-    """Export summary table as CSV."""
-    rows = get_summary_table(result, use_best_window=use_best_window)
+                       use_best_window: bool = True,
+                       robust_result: Optional[AnalysisResult] = None) -> None:
+    """Export summary table as CSV.
+
+    When ``robust_result`` is given, the raw and robust (outlier-excluded) metric
+    values are written side by side ("<metric>" and "<metric> (rob)" columns) so
+    the report carries both the true measurement and the robust value.
+    """
+    if robust_result is not None:
+        rows = get_dual_summary_table(result, robust_result, use_best_window=use_best_window)
+    else:
+        rows = get_summary_table(result, use_best_window=use_best_window)
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -29,7 +38,7 @@ def export_summary_csv(result: AnalysisResult, output_path: str | Path,
             headers = list(rows[0].keys())
             f.write(",".join(headers) + "\n")
             for row in rows:
-                f.write(",".join(str(row[h]) for h in headers) + "\n")
+                f.write(",".join(str(row.get(h, "")) for h in headers) + "\n")
 
 
 def export_avg_line_csv(recipe: RecipeData, output_path: str | Path) -> None:
@@ -102,8 +111,9 @@ def export_all_lines_csv(recipe: RecipeData, output_path: str | Path) -> None:
                 f.write("\n")
 
 
-def export_checklist(result: AnalysisResult, output_path: str | Path) -> None:
-    """Export spec judgment checklist."""
+def export_checklist(result: AnalysisResult, output_path: str | Path,
+                     robust_result: Optional[AnalysisResult] = None) -> None:
+    """Export spec judgment checklist (raw, with robust verdict when provided)."""
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -122,7 +132,11 @@ def export_checklist(result: AnalysisResult, output_path: str | Path) -> None:
         if result.spec_limit is not None:
             verdict = "PASS ✓" if result.spec_pass else "FAIL ✗"
             f.write(f"Spec Limit: {result.spec_limit} nm\n")
-            f.write(f"Judgment: {verdict}\n\n")
+            f.write(f"Judgment (raw): {verdict}\n")
+            if robust_result is not None and robust_result.spec_pass is not None:
+                rverdict = "PASS ✓" if robust_result.spec_pass else "FAIL ✗"
+                f.write(f"Judgment (robust, outlier-excluded): {rverdict}\n")
+            f.write("\n")
 
         f.write(f"{'Position':<10} {'Rep.Max':>10} {'Rep.1σ':>10} {'OPM Max':>10} {'OPM 1σ':>10}\n")
         f.write("-" * 50 + "\n")
