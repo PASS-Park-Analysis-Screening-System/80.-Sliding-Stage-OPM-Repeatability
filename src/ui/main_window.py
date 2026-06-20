@@ -458,6 +458,15 @@ class MainWindow(QMainWindow):
         if hasattr(self, "preset_manage_btn"):
             self.preset_manage_btn.setVisible(is_admin)
 
+        # Quality category (QC Check / Compare / MSA) — admin only.
+        if hasattr(self, "tabs") and hasattr(self, "quality_tabs"):
+            q_idx = self.tabs.indexOf(self.quality_tabs)
+            if q_idx != -1:
+                self.tabs.setTabVisible(q_idx, is_admin)
+                # Don't leave the hidden Quality page showing if it was active.
+                if not is_admin and self.tabs.currentWidget() is self.quality_tabs:
+                    self.tabs.setCurrentIndex(0)
+
         # Switcher widgets
         if hasattr(self, "mode_label"):
             # BMP bullet (●) instead of an astral-plane lock emoji, which can
