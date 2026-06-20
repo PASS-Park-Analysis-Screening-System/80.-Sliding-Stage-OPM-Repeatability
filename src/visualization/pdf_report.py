@@ -110,7 +110,7 @@ def _page_summary(result: AnalysisResult, robust_result, msa_result,
         s = (f"Rep. 1σ ({rep_basis}):  {rv} / {result.spec_limit:g} nm  →  "
              f"{_verdict_text(result.spec_pass)[0]}")
         if robust_result is not None and robust_result.spec_value is not None:
-            s += (f"   (robust {robust_result.spec_value:.3f} → "
+            s += (f"   (이상치 제외값 {robust_result.spec_value:.3f} → "
                   f"{_verdict_text(robust_result.spec_pass)[0]})")
         lines.append(s)
     if result.spec_opm_limit is not None:
@@ -118,7 +118,7 @@ def _page_summary(result: AnalysisResult, robust_result, msa_result,
         s = (f"OPM Max ({opm_basis}):  {ov} / {result.spec_opm_limit:g} nm  →  "
              f"{_verdict_text(result.spec_opm_pass)[0]}")
         if robust_result is not None and robust_result.spec_opm_value is not None:
-            s += (f"   (robust {robust_result.spec_opm_value:.3f} → "
+            s += (f"   (이상치 제외값 {robust_result.spec_opm_value:.3f} → "
                   f"{_verdict_text(robust_result.spec_opm_pass)[0]})")
         lines.append(s)
     for i, s in enumerate(lines):
@@ -142,7 +142,7 @@ def _page_summary(result: AnalysisResult, robust_result, msa_result,
             if rr == 0:
                 cell.set_facecolor("#e6e9ef")
                 cell.set_text_props(fontweight="bold")
-    fig.text(0.07, 0.288, "괄호 값 = robust(이상점 제외) · 단위 nm",
+    fig.text(0.07, 0.288, "괄호 값 = 이상치 제외값(이상 픽셀 제외) · 단위 nm",
              fontsize=7.5, color=_MUTED)
 
     # MSA + QC one-liners

@@ -894,14 +894,16 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(2)
 
-        # --- Control row: Robust 병기 toggle (everyone) + outlier threshold (admin) ---
+        # --- Control row: 이상치 제외값 병기 (everyone) + threshold (admin) + ⓘ ---
+        from PySide6.QtWidgets import QStyle
+        from PySide6.QtCore import QSize
         ctrl = QHBoxLayout()
         ctrl.setContentsMargins(6, 2, 6, 0)
         ctrl.setSpacing(8)
-        self.summary_show_robust = QCheckBox("Robust 병기")
+        self.summary_show_robust = QCheckBox("이상치 제외값 병기")
         self.summary_show_robust.setToolTip(
-            "반복 간 편차(Max−Min)가 큰 outlier 픽셀을 제외한 Robust 값을 "
-            "RAW 값 아래 함께 표시합니다. (기본: RAW만 표시)")
+            "반복 간 편차(Max−Min)가 큰 이상 픽셀을 제외한 값을 RAW 값 아래 함께 "
+            "표시합니다. (기본: RAW만 표시)")
         self.summary_show_robust.toggled.connect(self._on_reanalyze)
         ctrl.addWidget(self.summary_show_robust)
 
@@ -909,10 +911,10 @@ class MainWindow(QMainWindow):
         oc = QHBoxLayout(self.outlier_ctrl_widget)
         oc.setContentsMargins(0, 0, 0, 0)
         oc.setSpacing(4)
-        oc.addWidget(QLabel("Outlier 제외:"))
+        oc.addWidget(QLabel("이상치 제외:"))
         self.outlier_mode_combo = QComboBox()
         self.outlier_mode_combo.addItems(["Percentile", "Pixels"])
-        self.outlier_mode_combo.setFixedSize(110, 26)
+        self.outlier_mode_combo.setFixedSize(110, 30)
         self.outlier_mode_combo.currentTextChanged.connect(self._on_outlier_mode_changed)
         oc.addWidget(self.outlier_mode_combo)
         self.outlier_value_spin = QDoubleSpinBox()
@@ -920,22 +922,77 @@ class MainWindow(QMainWindow):
         self.outlier_value_spin.setValue(1.0)
         self.outlier_value_spin.setDecimals(1)
         self.outlier_value_spin.setSuffix(" %")
-        self.outlier_value_spin.setFixedSize(90, 26)
+        self.outlier_value_spin.setFixedSize(112, 30)
+        self.outlier_value_spin.setStyleSheet(
+            "QDoubleSpinBox { padding: 2px 6px; font-size: 13px; }"
+            "QDoubleSpinBox::up-button { width: 20px; }"
+            "QDoubleSpinBox::down-button { width: 20px; }")
         self.outlier_value_spin.valueChanged.connect(self._on_reanalyze)
         oc.addWidget(self.outlier_value_spin)
         ctrl.addWidget(self.outlier_ctrl_widget)
+
+        # ⓘ — educational illustration (available to everyone)
+        self.outlier_help_btn = QPushButton()
+        self.outlier_help_btn.setIcon(self.style().standardIcon(
+            QStyle.StandardPixmap.SP_MessageBoxInformation))
+        self.outlier_help_btn.setIconSize(QSize(16, 16))
+        self.outlier_help_btn.setFixedSize(24, 24)
+        self.outlier_help_btn.setCursor(Qt.WhatsThisCursor)
+        self.outlier_help_btn.setToolTip("이상치(제외 픽셀)가 무엇인지 현재 데이터로 보기")
+        self.outlier_help_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; }"
+            "QPushButton:hover { background: #181825; border-radius: 12px; }")
+        self.outlier_help_btn.clicked.connect(self._show_outlier_info_popup)
+        ctrl.addWidget(self.outlier_help_btn)
         ctrl.addStretch()
         v.addLayout(ctrl)
 
         legend = QLabel(
-            "기본은 <b>Raw</b>(전체 데이터, 참 측정값)만 표시. <b>Robust 병기</b> 체크 시 각 칸 "
-            "하단에 <b>Robust</b>(outlier 픽셀 제외) 값을 함께 표시하고 두 값이 다르면 노랑 강조. "
-            "Outlier = 반복 간 편차(Max−Min)가 큰 픽셀 (임계값 조정은 Admin 전용).")
+            "기본은 <b>Raw</b>(전체 데이터, 참 측정값)만 표시. <b>이상치 제외값 병기</b> 체크 시 각 칸 "
+            "하단에 <b>이상치 제외값</b>(이상 픽셀 제외)을 함께 표시하고 두 값이 다르면 노랑 강조. "
+            "이상치 = 반복 간 편차(Max−Min)가 큰 픽셀 (ⓘ로 확인 · 임계값 조정은 Admin).")
         legend.setWordWrap(True)
         legend.setStyleSheet("color:#a6adc8; font-size:11px; padding:3px 6px;")
         v.addWidget(legend)
         v.addWidget(table)
         return container
+
+    def _show_outlier_info_popup(self):
+        """Educational popup: show which pixels the outlier exclusion drops, using
+        the currently-loaded data (or a synthetic example when nothing is loaded)."""
+        from PySide6.QtWidgets import QDialog
+        from ..visualization.plot_manager import create_outlier_illustration_figure
+
+        mode = self.outlier_mode_combo.currentText().lower()
+        value = self.outlier_value_spin.value()
+        try:
+            fig = create_outlier_illustration_figure(self.current_recipe, mode, value)
+        except Exception as e:  # never let the help popup crash the app
+            QMessageBox.warning(self, "이상치 설명", f"도식 생성 실패: {e}")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("이상치(제외 픽셀) 설명")
+        dlg.setMinimumSize(780, 640)
+        dlg.setStyleSheet(
+            "QDialog { background-color: #1e1e2e; } QLabel { color: #cdd6f4; }"
+            "QPushButton { background:#45475a; color:#cdd6f4; padding:6px 18px;"
+            " border-radius:4px; } QPushButton:hover { background:#585b70; }")
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(14, 14, 14, 14)
+        intro = QLabel(
+            "<b>이상치(outlier) 픽셀</b> = 같은 위치를 반복 측정했을 때 <b>픽셀별 편차(Max−Min)가 "
+            "유난히 큰 지점</b>입니다(스크래치·파티클·순간 노이즈 등). 이 픽셀을 제외하고 다시 "
+            "계산한 값이 <b>'이상치 제외값'</b>입니다. 아래 <span style='color:#f38ba8'>빨강</span> = "
+            "현재 설정에서 제외될 픽셀.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("font-size:12px; padding:2px 2px 6px;")
+        lay.addWidget(intro)
+        lay.addWidget(FigureCanvas(fig), 1)
+        close = QPushButton("닫기")
+        close.clicked.connect(dlg.close)
+        lay.addWidget(close, alignment=Qt.AlignRight)
+        dlg.exec()
 
     def _create_flatten_tab(self) -> QWidget:
         """Flatten tab — single row controls for maximum chart space."""
@@ -2575,7 +2632,7 @@ class MainWindow(QMainWindow):
                 line += f" <span style='color:#a6adc8'>[{src}]</span>"
             if rr is not None and rr.spec_value is not None:
                 rob_icon = "\u2705" if rr.spec_pass else "\u274c"
-                line += (f"  <span style='color:#a6adc8'>(robust {rob_icon} "
+                line += (f"  <span style='color:#a6adc8'>(이상치 제외값 {rob_icon} "
                          f"{rr.spec_value:.3f})</span>")
             lines.append("")
             lines.append(line)
@@ -2590,7 +2647,7 @@ class MainWindow(QMainWindow):
                 line += f" <span style='color:#a6adc8'>[{src}]</span>"
             if rr is not None and rr.spec_opm_value is not None:
                 rob_icon = "\u2705" if rr.spec_opm_pass else "\u274c"
-                line += (f"  <span style='color:#a6adc8'>(robust {rob_icon} "
+                line += (f"  <span style='color:#a6adc8'>(이상치 제외값 {rob_icon} "
                          f"{rr.spec_opm_value:.3f})</span>")
             lines.append(line)
 
@@ -2598,8 +2655,8 @@ class MainWindow(QMainWindow):
         if rr is not None and r.overall_pass is not None and rr.overall_pass is not None \
                 and r.overall_pass != rr.overall_pass:
             lines.append("")
-            lines.append("<span style='color:#f9e2af'>\u26a0 Raw/Robust \ud310\uc815 \ubd88\uc77c\uce58 "
-                         "\u2014 outlier \uc601\ud5a5 (QC-5 \ud655\uc778)</span>")
+            lines.append("<span style='color:#f9e2af'>\u26a0 Raw/\uc774\uc0c1\uce58 \uc81c\uc678\uac12 \ud310\uc815 \ubd88\uc77c\uce58 "
+                         "\u2014 \uc774\uc0c1 \ud53d\uc140 \uc601\ud5a5 (QC-5 \ud655\uc778)</span>")
 
         self.spec_lines_label.setText("<br>".join(lines))
 

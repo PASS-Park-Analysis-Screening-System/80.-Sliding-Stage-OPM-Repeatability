@@ -19,10 +19,12 @@ matplotlib.rcParams["agg.path.chunksize"] = 10000
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.font_manager import FontProperties, findfont
 import numpy as np
 
 from ..core.data_loader import RecipeData, POSITION_LABELS, POSITION_GRID
-from ..core.analyzer import AnalysisResult, POSITION_GROUPS, resample_profile
+from ..core.analyzer import (AnalysisResult, POSITION_GROUPS, resample_profile,
+                             _exclude_outlier_pixels)
 from ..core.flatten import FlattenResult, polynomial_flatten, edge_only_flatten
 
 # --- Color Scheme ---
@@ -57,6 +59,126 @@ def _apply_dark_theme(ax, fig=None):
     for spine in ax.spines.values():
         spine.set_color(COLORS["grid"])
     ax.grid(True, color=COLORS["grid"], alpha=0.3, linewidth=0.5)
+
+
+def _korean_fontproperties() -> FontProperties:
+    """A CJK-capable FontProperties (Malgun Gothic on Windows) so Korean labels
+    don't render as tofu; falls back to default if none is available."""
+    for name in ("Malgun Gothic", "Gulim", "NanumGothic", "Noto Sans CJK KR", "AppleGothic"):
+        try:
+            if findfont(name, fallback_to_default=False):
+                return FontProperties(family=name)
+        except Exception:
+            continue
+    return FontProperties()
+
+
+_KFONT = _korean_fontproperties()
+
+
+def _shade_columns(ax, mask: np.ndarray, color: str, alpha: float = 0.18) -> None:
+    """Shade contiguous runs of True columns (e.g. excluded pixels) on ax."""
+    if not mask.any():
+        return
+    idx = np.where(mask)[0]
+    start = prev = idx[0]
+    for k in idx[1:]:
+        if k == prev + 1:
+            prev = k
+            continue
+        ax.axvspan(start - 0.5, prev + 0.5, color=color, alpha=alpha, lw=0)
+        start = prev = k
+    ax.axvspan(start - 0.5, prev + 0.5, color=color, alpha=alpha, lw=0)
+
+
+def create_outlier_illustration_figure(recipe, mode: str = "percentile",
+                                       value: float = 1.0, position: str | None = None,
+                                       figsize: tuple = (8.6, 6.0)) -> Figure:
+    """Educational 2-panel figure showing which pixels outlier-exclusion drops.
+
+    Top: every repeat profile for a position overlaid, with the excluded (high
+    repeat-deviation) pixel columns shaded red. Bottom: the per-pixel repeat range
+    (Max-Min) with the exclusion threshold; pixels above it are the dropped ones.
+    The most illustrative position (largest pixel range) is auto-picked when not
+    given. Falls back to a synthetic spike example if no data is available.
+    """
+    fig = Figure(figsize=figsize)
+    fig.set_facecolor(COLORS["bg"])
+    ax1 = fig.add_subplot(2, 1, 1)
+    ax2 = fig.add_subplot(2, 1, 2)
+
+    # --- Build a (repeats, pixels) stack from real data, else synthetic ---
+    stack = None
+    title_pos = position
+    if recipe is not None and getattr(recipe, "repeats", None):
+        best = None
+        for pos in POSITION_LABELS:
+            profs = [edge_only_flatten(r.profiles[pos].z_nm, order=1, edge_percent=1.0)
+                     for r in recipe.repeats if pos in r.profiles]
+            if len(profs) < 2:
+                continue
+            s = np.asarray(profs, dtype=np.float64)
+            if position is not None and pos == position:
+                stack, title_pos = s, pos
+                break
+            rng = float((s.max(axis=0) - s.min(axis=0)).max())
+            if best is None or rng > best[0]:
+                best = (rng, pos, s)
+        if stack is None and best is not None:
+            stack, title_pos = best[2], best[1]
+
+    synthetic = stack is None
+    if synthetic:
+        n = 400
+        x = np.linspace(0.0, 1.0, n)
+        base = 20.0 * (x - 0.5) ** 2
+        rng_state = np.random.RandomState(0)
+        rows = np.array([base + rng_state.normal(0, 0.3, n) for _ in range(5)])
+        rows[2, 190:210] += 8.0   # a localized spike in one repeat
+        stack, title_pos = rows, "예시 데이터"
+        mode, value = "percentile", 5.0
+
+    n_rep, n_px = stack.shape
+    px = np.arange(n_px)
+    pixel_range = stack.max(axis=0) - stack.min(axis=0)
+    valid = _exclude_outlier_pixels(stack, mode, value)
+    excluded = ~valid
+
+    # --- Top: overlaid repeats + excluded columns shaded red ---
+    _apply_dark_theme(ax1, fig)
+    for i in range(n_rep):
+        ax1.plot(px, stack[i], color=COLORS["overlay"][i % len(COLORS["overlay"])],
+                 lw=0.8, alpha=0.85)
+    _shade_columns(ax1, excluded, COLORS["red"])
+    ax1.set_title(f"반복 프로파일 오버레이 — {title_pos}   (빨강 = 제외 픽셀 {int(excluded.sum())}개)",
+                  fontsize=10, fontweight="bold", fontproperties=_KFONT)
+    ax1.set_ylabel("Height (nm)", fontproperties=_KFONT)
+
+    # --- Bottom: per-pixel repeat range + threshold + excluded markers ---
+    _apply_dark_theme(ax2, None)
+    ax2.plot(px, pixel_range, color=COLORS["accent"], lw=0.9,
+             label="픽셀별 반복 편차 (Max-Min)")
+    if mode == "percentile" and value > 0:
+        thr = float(np.percentile(pixel_range, 100 - value))
+        ax2.axhline(thr, color=COLORS["yellow"], ls="--", lw=1.0,
+                    label=f"임계값 (상위 {value:g}%)")
+    if excluded.any():
+        ax2.scatter(px[excluded], pixel_range[excluded], color=COLORS["red"],
+                    s=12, zorder=5, label="제외 픽셀")
+    ax2.set_xlabel("Pixel", fontproperties=_KFONT)
+    ax2.set_ylabel("Range (nm)", fontproperties=_KFONT)
+    leg = ax2.legend(prop=_KFONT, fontsize=7, facecolor=COLORS["bg"],
+                     edgecolor=COLORS["grid"], labelcolor=COLORS["fg"])
+    if leg:
+        leg.get_frame().set_alpha(0.6)
+
+    # Before/after Rep.Max caption
+    after = float(pixel_range[valid].max()) if valid.any() else 0.0
+    fig.text(0.5, 0.012,
+             f"Rep.Max (픽셀 편차 최대): 전체 {pixel_range.max():.2f} → 제외 후 {after:.2f} nm",
+             ha="center", color=COLORS["fg"], fontsize=8.5, fontproperties=_KFONT)
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
+    return fig
 
 
 def create_profile_overlay_figure(recipe: RecipeData,
