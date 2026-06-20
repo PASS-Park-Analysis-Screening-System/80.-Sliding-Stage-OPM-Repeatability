@@ -149,6 +149,35 @@ def export_checklist(result: AnalysisResult, output_path: str | Path,
                         f"{p.opm_max:>10.3f} {p.opm_1sigma:>10.3f}\n")
 
 
+def export_msa_csv(msa_result, output_path: str | Path) -> None:
+    """Export an MSA / Gauge R&R result (repeatability-focused) as CSV."""
+    m = msa_result
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        f.write("MSA / Gauge R&R (repeatability-focused EV, single appraiser)\n")
+        f.write(f"Characteristic,{m.characteristic}\n")
+        f.write(f"Parts (positions),{m.n_parts}\n")
+        f.write(f"Trials (repeats),{m.n_trials}\n")
+        f.write(f"Study sigma,{m.study_sigma}\n")
+        f.write(f"EV repeatability (nm),{m.ev:.4f}\n")
+        f.write(f"PV part variation (nm),{m.pv:.4f}\n")
+        f.write(f"TV total (nm),{m.tv:.4f}\n")
+        f.write(f"%EV,{m.pct_ev:.2f}\n")
+        f.write(f"%PV,{m.pct_pv:.2f}\n")
+        f.write(f"%GRR (vs TV),{m.pct_grr:.2f}\n")
+        f.write(f"%GRR (vs tolerance),{'' if m.pct_grr_tol is None else f'{m.pct_grr_tol:.2f}'}\n")
+        f.write(f"Tolerance (nm),{'' if m.tolerance is None else m.tolerance}\n")
+        f.write(f"ndc,{m.ndc}\n")
+        f.write(f"Verdict,{m.verdict}\n")
+        f.write(f'Note,"{m.note}"\n')
+        f.write("\n")
+        f.write("Position,Mean OPM (nm),Repeat Stdev (nm)\n")
+        for pos, mean in m.part_means.items():
+            f.write(f"{pos},{mean:.4f},{m.part_stdevs.get(pos, 0.0):.4f}\n")
+
+
 def export_ball_screw_csv(
     bs_result,
     output_dir: str | Path,

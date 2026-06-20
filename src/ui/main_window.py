@@ -60,7 +60,7 @@ from ..visualization.plot_manager import (
 )
 from ..visualization.report_generator import (
     export_summary_csv, export_avg_line_csv, export_all_lines_csv, export_checklist,
-    export_ball_screw_csv,
+    export_ball_screw_csv, export_msa_csv,
 )
 
 # --- Style ---
@@ -203,6 +203,7 @@ class MainWindow(QMainWindow):
         self.current_bs_result: Optional[BallScrewAnalysisResult] = None
         self.current_qc_result: Optional[QCResult] = None
         self.current_compare_result: Optional[CompareResult] = None
+        self.current_msa_result = None  # MSAResult (Gauge R&R), set on analysis
         self.reference_dataset = None  # DataSet for comparison
         self.reference_result: Optional[AnalysisResult] = None
         self.flatten_proc = FlattenProcessor()
@@ -307,6 +308,7 @@ class MainWindow(QMainWindow):
         self.res_compare_canvas = FigureCanvas(Figure(figsize=(14, 7)))
         self.qc_widget = self._create_qc_tab()
         self.compare_widget = self._create_compare_tab()
+        self.msa_widget = self._create_msa_tab()
         self.remark_widget = self._create_remark_tab()
 
         # Profile Charts wrapper with Y-axis scale toolbar
@@ -380,6 +382,7 @@ class MainWindow(QMainWindow):
         self.quality_tabs.setStyleSheet(_inner_tab_style)
         self.quality_tabs.addTab(self.qc_widget, "QC Check")
         self.quality_tabs.addTab(self.compare_widget, "Compare")
+        self.quality_tabs.addTab(self.msa_widget, "MSA (Gauge R&R)")
 
         # Tools category
         self.tools_tabs = QTabWidget()
@@ -2382,6 +2385,7 @@ class MainWindow(QMainWindow):
 
         self._update_summary_table()
         self._update_spec_display()
+        self._update_msa()
         self._update_scan_info()
         self._update_res_slider_range()
         self._update_profile_chart()
@@ -2570,6 +2574,112 @@ class MainWindow(QMainWindow):
             self.spec_verdict_label.setText("\u2014")
             self.spec_verdict_label.setStyleSheet(
                 "font-size: 18px; font-weight: bold; padding: 4px;")
+
+    def _create_msa_tab(self) -> QWidget:
+        """MSA / Gauge R&R tab: verdict summary + per-position chart + table."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        self.msa_summary_label = QLabel("분석 후 표시됩니다.")
+        self.msa_summary_label.setWordWrap(True)
+        self.msa_summary_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.msa_summary_label.setStyleSheet(
+            "font-size: 12px; color: #cdd6f4; padding: 4px;")
+        layout.addWidget(self.msa_summary_label)
+
+        self.msa_canvas = FigureCanvas(Figure(figsize=(10, 4)))
+        layout.addWidget(self.msa_canvas, 1)
+
+        self.msa_table = QTableWidget()
+        self.msa_table.setColumnCount(3)
+        self.msa_table.setHorizontalHeaderLabels(
+            ["Position", "Mean OPM (nm)", "Repeat σ (nm)"])
+        self.msa_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.msa_table.verticalHeader().setVisible(False)
+        self.msa_table.setAlternatingRowColors(True)
+        self.msa_table.setMaximumHeight(240)
+        layout.addWidget(self.msa_table)
+
+        return widget
+
+    def _update_msa(self):
+        """Recompute the gauge study from the raw result and refresh the MSA tab."""
+        if not hasattr(self, "msa_summary_label"):
+            return
+        if not self.current_result:
+            self.current_msa_result = None
+            self.msa_summary_label.setText("분석 후 표시됩니다.")
+            self.msa_table.setRowCount(0)
+            self._update_canvas(self.msa_canvas, Figure(figsize=(10, 4)))
+            return
+
+        from ..core.msa import compute_msa, NDC_CAP
+        m = compute_msa(self.current_result)
+        self.current_msa_result = m
+
+        scope = ("<b>MSA — 반복성(EV) Type-1 Gage</b> "
+                 "<span style='color:#f9e2af'>· 재현성(AV) 미포함</span>")
+        if m.verdict == "N/A":
+            self.msa_summary_label.setText(
+                f"{scope}<br><span style='color:#a6adc8'>{m.note}</span>")
+            self.msa_table.setRowCount(0)
+            self._update_canvas(self.msa_canvas, Figure(figsize=(10, 4)))
+            return
+
+        color = {"우수 (수용)": "#a6e3a1", "조건부 수용": "#f9e2af",
+                 "부적합": "#f38ba8"}.get(m.verdict, "#cdd6f4")
+        drv = " <b style='color:#f9e2af'>←판정</b>"
+        tv_tag = drv if m.judged_by == "tv" else ""
+        if m.pct_grr_tol is not None:
+            tol_tag = drv if m.judged_by == "tolerance" else ""
+            tol_line = f"%GRR(공차) <b>{m.pct_grr_tol:.1f}%</b>{tol_tag}"
+        else:
+            tol_line = "%GRR(공차) N/A (공차 미설정)"
+        ndc_disp = f"{m.ndc}+" if m.ndc >= NDC_CAP else f"{m.ndc}"
+        ndc_color = "#a6e3a1" if m.ndc >= 5 else ("#f9e2af" if m.ndc >= 2 else "#f38ba8")
+        self.msa_summary_label.setText(
+            f"{scope}<br>"
+            f"특성치 {m.characteristic} · 부품 {m.n_parts} · 시행 {m.n_trials} · "
+            f"{m.study_sigma:.3g}σ<br>"
+            f"<span style='color:{color}; font-size:15px; font-weight:bold'>"
+            f"판정: {m.verdict}</span> "
+            "<span style='color:#a6adc8'>(&lt;10% 우수 · 10–30% 조건부 · &gt;30% 부적합)</span><br>"
+            f"EV(반복성) {m.ev:.3f} · PV(부품) {m.pv:.3f} · TV {m.tv:.3f} nm<br>"
+            f"%EV {m.pct_ev:.1f}% · %PV {m.pct_pv:.1f}% · "
+            f"<b>%GRR(TV) {m.pct_grr:.1f}%</b>{tv_tag} · {tol_line} · "
+            f"ndc <b style='color:{ndc_color}'>{ndc_disp}</b> "
+            "<span style='color:#a6adc8'>(≥5 권장)</span><br>"
+            f"<span style='color:#a6adc8'>{m.note}</span>")
+
+        # Per-position bar chart: mean OPM ± repeat σ
+        positions = list(m.part_means.keys())
+        means = [m.part_means[p] for p in positions]
+        errs = [m.part_stdevs.get(p, 0.0) for p in positions]
+        fig = Figure(figsize=(10, 4))
+        fig.patch.set_facecolor("#1e1e2e")
+        ax = fig.add_subplot(111)
+        ax.set_facecolor("#181825")
+        ax.bar(range(len(positions)), means, yerr=errs, capsize=3,
+               color="#89b4fa", ecolor="#cdd6f4")
+        ax.set_xticks(range(len(positions)))
+        ax.set_xticklabels(positions, rotation=45, ha="right", fontsize=8)
+        ax.set_ylabel("OPM (nm)")
+        ax.set_title("Position별 평균 OPM ± repeat σ")
+        ax.tick_params(colors="#cdd6f4")
+        ax.yaxis.label.set_color("#cdd6f4")
+        ax.title.set_color("#cdd6f4")
+        for spine in ax.spines.values():
+            spine.set_color("#45475a")
+        self._update_canvas(self.msa_canvas, fig)
+
+        # Per-position table
+        self.msa_table.setRowCount(len(positions))
+        for i, p in enumerate(positions):
+            self.msa_table.setItem(i, 0, QTableWidgetItem(p))
+            self.msa_table.setItem(i, 1, QTableWidgetItem(f"{m.part_means[p]:.3f}"))
+            self.msa_table.setItem(i, 2, QTableWidgetItem(f"{m.part_stdevs.get(p, 0.0):.3f}"))
 
     def _update_scan_info(self):
         """Update Scan Parameters panel from current recipe."""
@@ -3035,6 +3145,11 @@ class MainWindow(QMainWindow):
             export_avg_line_csv(self.current_recipe, base / f"avg_lines_{rl}.csv")
             export_checklist(self.current_result, base / f"checklist_{rl}.txt",
                              robust_result=self.current_result_robust)
+            if self.current_msa_result and self.current_msa_result.verdict != "N/A":
+                export_msa_csv(self.current_msa_result, base / f"msa_{rl}.csv")
+                self.msa_canvas.figure.savefig(
+                    str(base / f"msa_{rl}.png"), dpi=150,
+                    facecolor="#1e1e2e", bbox_inches="tight")
 
             for name, canvas in [("profiles", self.profile_canvas),
                                   ("trend", self.trend_canvas),
