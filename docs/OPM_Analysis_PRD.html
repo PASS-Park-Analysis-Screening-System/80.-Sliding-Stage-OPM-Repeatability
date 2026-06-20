@@ -654,7 +654,7 @@ Dishing = DishingTop   − DishingBottom</div>
   <span class="t">알려진 한계 &amp; 기본값 (최종 검수 v2.1)</span>
   <ul style="margin:6px 0;">
     <li><b>Rep. 1σ</b>는 <code>ddof=1</code>(표본표준편차) — N=5 불편추정량, 기준 Tool 정합. ddof=0은 σ를 ~12% 과소평가.</li>
-    <li><b>Outlier — Raw + Robust 병기</b>: 모든 지표를 Raw(전체)와 Robust(outlier 제외, 기본 Percentile 1%) 두 값으로 함께 표시(Summary/Spec/CSV). Raw가 headline, QC-5가 outlier 별도 WARN, 판정 불일치 시 경고. 상수 <code>analyzer.ROBUST_OUTLIER_MODE/VALUE</code>.</li>
+    <li><b>Outlier — 기본 Raw, "이상치 제외값" 병기(선택)</b>: 기본은 Raw(전체)만 표시, Summary 탭 <b>"이상치 제외값 병기"</b> 체크 시 이상치 제외값(이상 픽셀 제외, 기본 Percentile 1%)을 병기. QC-5가 이상치 별도 WARN, 판정 불일치 시 경고. 상수 <code>analyzer.ROBUST_OUTLIER_MODE/VALUE</code>(내부 유지). 임계값 조정은 Admin, ⓘ로 제외 픽셀 시각화.</li>
     <li><b>OPM Max ~4~5% intrinsic 잔차</b> — 기준값이 데이터 raw P-V보다 높아 재현 불가(z_scale=1.0, 알고리즘 오류 아님). AFP 변환식 확보 시에만 정합.</li>
     <li>회귀 점검: <code>python scripts/validate_against_reference.py</code> (OPM Max는 intrinsic 분류).</li>
   </ul>
@@ -689,19 +689,21 @@ Dishing = DishingTop   − DishingBottom</div>
 <ul>
   <li><b>인증</b>: Admin은 <b>PIN</b>(SHA-256 해시, 평문 미저장). 기본 <code>0000</code>, 사이트값은
     <code>config/app_config.json</code>(gitignore). <span class="src">core/app_config.py · ui/pin_dialog.py</span></li>
-  <li><b>Admin 전용</b>: Flatten 탭 · Robust outlier 튜닝 · Spec 프리셋 편집 · PIN 변경 ·
-    <b>Quality 카테고리(QC Check · Compare · MSA)</b></li>
-  <li><b>일반(기본)</b>: 데이터 로드 · Profile · Summary · Wafer Map · Tools · Export · 검수 리포트 · 프리셋 <i>선택</i></li>
+  <li><b>Admin 전용</b>: Flatten 탭 · 이상치 제외 <b>임계값</b>(Summary 탭) · PIN 변경 ·
+    <b>Quality 카테고리(QC Check · Compare · MSA · Spec 관리)</b></li>
+  <li><b>일반(기본)</b>: 데이터 로드 · Profile · Summary(이상치 제외값 병기 토글) · Wafer Map · Tools ·
+    Export · 검수 리포트. <b>판정은 고정 표준 Spec</b>(프리셋/override는 Admin이 Quality에서 관리).</li>
 </ul>
 
-<h3>17.2 Spec / Recipe 프리셋</h3>
-<p>판정 설정을 명명 프리셋으로 저장/로드(장비유형 · outlier · range별 spec override · 리포트 메타).
-<span class="src">core/spec_config.py · ui/preset_dialog.py</span></p>
+<h3>17.2 Spec 관리 (Quality, Admin 전용)</h3>
+<p>표준 Spec은 <b>고정</b>이다. 일반 사용자는 내장 표준 Spec으로만 판정하고, 프리셋(장비유형 · outlier ·
+range별 spec override · 리포트 메타)의 <b>선택/적용/편집</b>은 <b>Quality &gt; "Spec 관리" 탭(Admin 전용)</b>에서만
+한다. <span class="src">core/spec_config.py · ui/preset_dialog.py</span></p>
 <ul>
-  <li><code>analyze_recipe(..., spec_overrides=)</code>: 프리셋의 <code>rep_limit/opm_limit</code>가 내장
-    <code>SPEC_*</code> 표를 <b>range별</b> 대체. 없으면 내장값(하위호환).</li>
-  <li>일반=선택, Admin=편집. Spec 패널에 한계 출처 <code>[프리셋]</code>/<code>[기본]</code> 표기,
-    현재 range에 override가 없으면 경고 표시.</li>
+  <li><code>analyze_recipe(..., spec_overrides=)</code>: 적용된 프리셋의 <code>rep_limit/opm_limit</code>가 내장
+    <code>SPEC_*</code> 표를 <b>range별</b> 대체. 미적용(일반 기본)이면 내장 표준값(하위호환). "표준으로"로 해제.</li>
+  <li>Admin이 프리셋 적용 시 Spec 패널에 한계 출처 <code>[프리셋]</code>/<code>[기본]</code> 표기,
+    현재 range에 override가 없으면 경고. 장비유형(iso/dw)은 좌측 유지(측정 속성).</li>
 </ul>
 
 <h3>17.3 MSA / Gauge R&amp;R (반복성 EV Type-1)</h3>
@@ -726,14 +728,17 @@ Quality 탭이 EV-only 범위·판정 기준 비율을 명시한다.</p>
 <span class="src">visualization/pdf_report.py</span></p>
 <ul>
   <li><b>p1</b>: 헤더(장비 · recipe · 일시 · 작성자 · Lot) · 종합 PASS/FAIL · <b>판정 repeat(Best-5 window)</b> ·
-    raw|robust spec(집계규칙 <i>Total RMS/Max</i> vs <i>Center 5_CM</i> 표기) · 9-point dual 표 · MSA/QC 요약 ·
+    raw|이상치 제외값 spec(집계규칙 <i>Total RMS/Max</i> vs <i>Center 5_CM</i> 표기) · 9-point dual 표 · MSA/QC 요약 ·
     작성/검토/승인 서명란 · 푸터(algorithm_spec v2.1 · PMS Q&amp;A 4249).</li>
   <li><b>p2</b>: Wafer Map · MSA Position별 평균 OPM ± repeat σ 차트.</li>
 </ul>
 
-<h3>17.5 Summary 테이블 — Raw + Robust 병기</h3>
-<p>각 지표 셀을 <b>상단 Raw / 하단 Robust</b> 2줄로 표시(두 값 상이 시 노랑 강조).
-말줄임(ElideNone) 해제 · Range/Position 열폭 축소로 두 값을 전부 노출한다.</p>
+<h3>17.5 Summary 테이블 — 기본 Raw, "이상치 제외값" 병기(선택)</h3>
+<p>기본은 <b>Raw</b>(참 측정값)만 1줄로 표시하며 <b>셀은 읽기전용</b>이다. <b>"이상치 제외값 병기"</b> 체크 시
+각 칸 하단에 <b>이상치 제외값</b>(이상 픽셀 제외)을 2줄로 함께 표시하고 두 값 상이 시 노랑 강조
+(말줄임 해제 · Range/Position 열폭 축소). 이상치 제외 <b>임계값</b> 조정은 Admin, 병기 토글은 전원.
+<b>ⓘ</b> 버튼이 현재 데이터에서 제외 픽셀을 빨강으로 시각화
+(<span class="src">plot_manager.create_outlier_illustration_figure</span>).</p>
 
 <!-- ====================== 16. 부록 ====================== -->
 <h2 class="sec" id="s16">부록</h2>
@@ -800,6 +805,7 @@ Quality 탭이 EV-only 범위·판정 기준 비율을 명시한다.</p>
     <tr><td>v2.0 (2026-04)</td><td>연구소 답변 반영(PMS Q&amp;A 4249) — Order-1 <b>edge-only</b> flatten, outlier 제외, Rep.1σ·OPM 1σ를 RMS 정의로 변경</td></tr>
     <tr><td>v2.1 (2026-06)</td><td>최종 검수 — Rep.1σ <code>ddof=1</code>(표본표준편차, N=5 불편추정량), Outlier <b>Raw+Robust 병기</b>, 표시/상세 leveling 일치, 검증 하니스 추가</td></tr>
     <tr><td>v2.2 (2026-06)</td><td><b>도구 기능</b>(판정 알고리즘 불변) — 일반/Admin 접근제어(PIN), Spec/Recipe 프리셋, MSA/Gauge R&amp;R, PDF 검수 리포트, Summary 2줄 병기 (§17)</td></tr>
+    <tr><td>v2.3 (2026-06)</td><td><b>UX/IA 정리</b>(알고리즘 불변) — Summary 기본 Raw + <b>"이상치 제외값" 병기 토글</b>·outlier 컨트롤 Summary 이관·셀 읽기전용·스핀박스 수정; <b>Quality(Admin 전용)</b>에 Spec 관리 포함, 일반=고정 표준 Spec; <b>"Robust"→"이상치 제외값"</b> 표기 통일; 이상치 <b>ⓘ 시각화 팝업</b>(제외 픽셀 빨강)</td></tr>
   </tbody>
 </table>
 
