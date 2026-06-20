@@ -129,6 +129,7 @@
     <li><a href="#s13">Ball Screw / Dishing (옵션)</a></li>
     <li><a href="#s14">시각화 (Charts)</a></li>
     <li><a href="#s15">검증 기준값 &amp; 재현 방법</a></li>
+    <li><a href="#s17">도구 기능 &amp; 접근제어 (앱 v2.2)</a></li>
     <li><a href="#s16">부록</a></li>
   </ol>
   <p class="small" style="margin-top:18px;">문서판 v1.0 · 2026-05-29<br>대상: <code>main.py → src/</code></p>
@@ -664,7 +665,7 @@ Dishing = DishingTop   − DishingBottom</div>
   <li><b>로드</b>: TIFF Tag 50434(float32×8192) + 50435(580B 헤더) 읽기 → §4.3 공식으로 <code>z_nm</code>, §4.4로 <code>x_mm</code> 생성. <b>z 감도 부호 보존</b> 필수.</li>
   <li><b>평탄화</b>: 각 프로파일에 <code>edge_only_flatten(order=1, edge_percent=1.0)</code> 적용 (§6.1).</li>
   <li><b>스택 &amp; outlier</b>: 위치별 <code>stack(repeats, pixels)</code> 구성, <code>pixel Max-Min</code> 기준 마스크 (§6.2).</li>
-  <li><b>지표</b>: §7의 4식 그대로 계산 (Rep.1σ·OPM 1σ는 RMS, ddof=0).</li>
+  <li><b>지표</b>: §7의 4식 그대로 계산 (Rep.1σ는 픽셀별 repeat <code>ddof=1</code> 표본표준편차의 RMS, OPM 1σ는 zero 기준 RMS — v2.1).</li>
   <li><b>Best-5 / Spec</b>: §8, §9 (장비 타입 dw/iso 분기).</li>
   <li><b>검증</b>: 위 1mm/1_LT 기준값과 대조 (허용 ±0.01 nm 수준).</li>
 </ol>
@@ -676,6 +677,63 @@ Dishing = DishingTop   − DishingBottom</div>
   <li>☐ 좌측 TOC 앵커가 모든 섹션으로 정확히 이동</li>
   <li>☐ 핵심 상수(8192, 2²⁰, 헤더 오프셋, Spec 표)와 수식이 소스와 일치</li>
 </ul>
+
+<!-- ====================== 17. 도구 기능 & 접근제어 ====================== -->
+<h2 class="sec" id="s17">도구 기능 &amp; 접근제어 (애플리케이션 v2.2)</h2>
+<p>아래는 <b>분석 알고리즘과 무관한 애플리케이션(UI/운영) 기능</b>이다. 판정 알고리즘(§6–§9)은 변경되지 않았다
+(<code>analyze_recipe</code>의 <code>spec_overrides</code>는 한계값 주입일 뿐 계산식 불변).</p>
+
+<h3>17.1 접근제어 — 일반 / Admin (2단계)</h3>
+<p>제조엔지니어·품질팀이 함께 쓰는 통합툴로서, <b>표준 판정 기준을 바꾸는 행위</b>만 Admin으로 잠근다
+(현장 오조작 방지 deterrent — OS 수준 보안 아님).</p>
+<ul>
+  <li><b>인증</b>: Admin은 <b>PIN</b>(SHA-256 해시, 평문 미저장). 기본 <code>0000</code>, 사이트값은
+    <code>config/app_config.json</code>(gitignore). <span class="src">core/app_config.py · ui/pin_dialog.py</span></li>
+  <li><b>Admin 전용</b>: Flatten 탭 · Robust outlier 튜닝 · Spec 프리셋 편집 · PIN 변경 ·
+    <b>Quality 카테고리(QC Check · Compare · MSA)</b></li>
+  <li><b>일반(기본)</b>: 데이터 로드 · Profile · Summary · Wafer Map · Tools · Export · 검수 리포트 · 프리셋 <i>선택</i></li>
+</ul>
+
+<h3>17.2 Spec / Recipe 프리셋</h3>
+<p>판정 설정을 명명 프리셋으로 저장/로드(장비유형 · outlier · range별 spec override · 리포트 메타).
+<span class="src">core/spec_config.py · ui/preset_dialog.py</span></p>
+<ul>
+  <li><code>analyze_recipe(..., spec_overrides=)</code>: 프리셋의 <code>rep_limit/opm_limit</code>가 내장
+    <code>SPEC_*</code> 표를 <b>range별</b> 대체. 없으면 내장값(하위호환).</li>
+  <li>일반=선택, Admin=편집. Spec 패널에 한계 출처 <code>[프리셋]</code>/<code>[기본]</code> 표기,
+    현재 range에 override가 없으면 경고 표시.</li>
+</ul>
+
+<h3>17.3 MSA / Gauge R&amp;R (반복성 EV Type-1)</h3>
+<p>툴의 핵심인 "측정 반복성"을 AIAG MSA 지표로 변환한다. <b>특성치 = repeat별 OPM</b>, 부품 = 9 위치, 시행 = repeat.
+<b>단일 자동 장비 → 측정자(AV/재현성) 축 없음</b> → 정직하게 <b>반복성(EV) 중심 Type-1 Gage</b>(%GRR = %EV).
+진짜 Gauge R&amp;R(Lot/PM/일자를 측정자로)은 Tier-2 후속. <span class="src">core/msa.py</span></p>
+<table>
+  <thead><tr><th>지표</th><th>정의</th></tr></thead>
+  <tbody>
+    <tr><td>EV (반복성 1σ)</td><td><code>sqrt( Σ SS_i / Σ df_i )</code> — df-가중 pooled within-part (균형이면 <code>sqrt(mean s_i²)</code>)</td></tr>
+    <tr><td>PV (부품 1σ)</td><td><code>sqrt(max(0, Var(부품평균) − EV²/n0))</code> — bias 보정, n0 = one-way 유효 시행수</td></tr>
+    <tr><td>TV</td><td><code>sqrt(EV² + PV²)</code></td></tr>
+    <tr><td>%GRR</td><td><code>%EV = EV/TV</code> (AV 없음). 공차 기준 <code>6σ·EV / tolerance</code>, tolerance = <code>spec_opm_limit</code>(OPM 상한 <b>단측</b>)</td></tr>
+    <tr><td>ndc</td><td><code>floor(1.41·PV/EV)</code> (상한 99; EV≈0 = 다범주 = 우수)</td></tr>
+  </tbody>
+</table>
+<p class="small">판정: %GRR &lt; 10% 우수 · 10–30% 조건부 · &gt; 30% 부적합 · ndc ≥ 5 권장.
+Quality 탭이 EV-only 범위·판정 기준 비율을 명시한다.</p>
+
+<h3>17.4 PDF 검수 리포트</h3>
+<p>1클릭 2페이지 보관용 리포트(matplotlib PdfPages, 신규 의존성 0; 한글은 Malgun Gothic).
+<span class="src">visualization/pdf_report.py</span></p>
+<ul>
+  <li><b>p1</b>: 헤더(장비 · recipe · 일시 · 작성자 · Lot) · 종합 PASS/FAIL · <b>판정 repeat(Best-5 window)</b> ·
+    raw|robust spec(집계규칙 <i>Total RMS/Max</i> vs <i>Center 5_CM</i> 표기) · 9-point dual 표 · MSA/QC 요약 ·
+    작성/검토/승인 서명란 · 푸터(algorithm_spec v2.1 · PMS Q&amp;A 4249).</li>
+  <li><b>p2</b>: Wafer Map · MSA Position별 평균 OPM ± repeat σ 차트.</li>
+</ul>
+
+<h3>17.5 Summary 테이블 — Raw + Robust 병기</h3>
+<p>각 지표 셀을 <b>상단 Raw / 하단 Robust</b> 2줄로 표시(두 값 상이 시 노랑 강조).
+말줄임(ElideNone) 해제 · Range/Position 열폭 축소로 두 값을 전부 노출한다.</p>
 
 <!-- ====================== 16. 부록 ====================== -->
 <h2 class="sec" id="s16">부록</h2>
@@ -708,7 +766,8 @@ Dishing = DishingTop   − DishingBottom</div>
     <tr><td>DW / 일체형</td><td>Double-Walled AE — Center(5_CM) 단일 위치로 판정</td></tr>
     <tr><td>ISO / 분리형</td><td>Isolated AE — 전체 위치 RMS/Max로 판정</td></tr>
     <tr><td>Best-5</td><td>mean Rep. 1σ가 최소인 연속 5-repeat 구간</td></tr>
-    <tr><td>ddof=0</td><td>모표준편차(N으로 나눔)</td></tr>
+    <tr><td>ddof=1</td><td>표본표준편차(N−1로 나눔; Rep.1σ에 사용, N=5 불편추정량)</td></tr>
+    <tr><td>%GRR / ndc</td><td>MSA — 측정변동/총변동 비율 / 구분 가능 범주 수 (§17.3)</td></tr>
   </tbody>
 </table>
 
@@ -725,6 +784,11 @@ Dishing = DishingTop   − DishingBottom</div>
     <tr><td><code>src/core/ball_screw_analyzer.py</code></td><td>Dishing/Erosion(CMP) 분석</td></tr>
     <tr><td><code>src/visualization/plot_manager.py</code></td><td>6종 Matplotlib 차트 생성</td></tr>
     <tr><td><code>src/ui/position_detail_dialog.py</code></td><td>pyqtgraph 위치 상세 다이얼로그</td></tr>
+    <tr><td><code>src/core/app_config.py</code></td><td>Admin PIN(해시) · 설정 영속화 (v2.2)</td></tr>
+    <tr><td><code>src/core/spec_config.py</code></td><td>Spec/Recipe 프리셋 CRUD + override 해석 (v2.2)</td></tr>
+    <tr><td><code>src/core/msa.py</code></td><td>MSA / Gauge R&amp;R — 반복성 EV Type-1 (v2.2)</td></tr>
+    <tr><td><code>src/visualization/pdf_report.py</code></td><td>PDF 검수 리포트 2페이지 (v2.2)</td></tr>
+    <tr><td><code>src/ui/pin_dialog.py · preset_dialog.py</code></td><td>Admin PIN · 프리셋 관리 다이얼로그 (v2.2)</td></tr>
   </tbody>
 </table>
 
@@ -734,6 +798,8 @@ Dishing = DishingTop   − DishingBottom</div>
   <tbody>
     <tr><td>v1.0 (2026-03)</td><td>초기 구현 — Rep용 Order-2, OPM용 Order-1, 전체구간 fitting</td></tr>
     <tr><td>v2.0 (2026-04)</td><td>연구소 답변 반영(PMS Q&amp;A 4249) — Order-1 <b>edge-only</b> flatten, outlier 제외, Rep.1σ·OPM 1σ를 RMS 정의로 변경</td></tr>
+    <tr><td>v2.1 (2026-06)</td><td>최종 검수 — Rep.1σ <code>ddof=1</code>(표본표준편차, N=5 불편추정량), Outlier <b>Raw+Robust 병기</b>, 표시/상세 leveling 일치, 검증 하니스 추가</td></tr>
+    <tr><td>v2.2 (2026-06)</td><td><b>도구 기능</b>(판정 알고리즘 불변) — 일반/Admin 접근제어(PIN), Spec/Recipe 프리셋, MSA/Gauge R&amp;R, PDF 검수 리포트, Summary 2줄 병기 (§17)</td></tr>
   </tbody>
 </table>
 
