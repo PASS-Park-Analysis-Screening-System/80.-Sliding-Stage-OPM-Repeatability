@@ -1,6 +1,10 @@
 # === Data & Agent (user-managed) ===
 /data/
 /.agent/
+/25mm/
+
+# === Site-specific config (admin PIN hash, presets) ===
+/config/app_config.json
 
 # === Python ===
 __pycache__/

@@ -44,6 +44,7 @@ from ..core.qc_checker import run_qc_checks, QCResult
 from ..core.comparator import compare_results, get_compare_table, CompareResult
 from ..core.analyzer import compute_normalized_opm
 from ..core.flatten import FlattenProcessor
+from ..core import app_config
 from ..core.time_analysis import extract_recipe_timing, RecipeTiming, format_timing_summary
 from ..core.ball_screw_analyzer import (
     analyze_ball_screw, BallScrewAnalysisResult, get_dishing_matrix,
@@ -204,6 +205,7 @@ class MainWindow(QMainWindow):
         self._worker: Optional[LoadWorker] = None
         self._loaded_path: Optional[str] = None
         self._block_range_signal = False
+        self.role = "general"  # access role: "general" | "admin" (admin gated by PIN)
 
         # Debounced re-layout of chart canvases on window resize
         self._resize_debounce = QTimer()
@@ -213,6 +215,7 @@ class MainWindow(QMainWindow):
 
         self._setup_ui()
         self.setStyleSheet(DARK_STYLE)
+        self._apply_role_visibility()
         self._fit_to_screen()
 
     def _fit_to_screen(self):
@@ -414,6 +417,80 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Side panel hidden (F11)", 2000)
 
+    # ------------------------------------------------------------------
+    # Access control (general / admin)
+    # ------------------------------------------------------------------
+    def _apply_role_visibility(self):
+        """Show/hide menus per the active role.
+
+        General (default): standard analysis, judgment and reports.
+        Admin: also exposes data-altering controls — the Flatten tab and the
+        Robust outlier tuning — plus the PIN-change button.
+        """
+        is_admin = self.role == "admin"
+
+        # Flatten tab — admin only (manual leveling can deviate from the metric).
+        if hasattr(self, "analysis_tabs") and hasattr(self, "flatten_widget"):
+            idx = self.analysis_tabs.indexOf(self.flatten_widget)
+            if idx != -1:
+                self.analysis_tabs.setTabVisible(idx, is_admin)
+                # setTabVisible(False) keeps a hidden-but-current tab showing its
+                # page; if we just hid the active Flatten tab, move selection off
+                # it so the admin-only page can't linger in general mode.
+                if not is_admin and self.analysis_tabs.currentWidget() is self.flatten_widget \
+                        and hasattr(self, "profile_tab_widget"):
+                    self.analysis_tabs.setCurrentWidget(self.profile_tab_widget)
+
+        # Robust outlier tuning — admin only; general stays on the locked preset.
+        if hasattr(self, "outlier_frame"):
+            self.outlier_frame.setEnabled(is_admin)
+
+        # Switcher widgets
+        if hasattr(self, "mode_label"):
+            # BMP bullet (●) instead of an astral-plane lock emoji, which can
+            # render as tofu on some Windows Qt fonts; color carries the state.
+            if is_admin:
+                self.mode_label.setText("● Admin 모드")
+                self.mode_label.setStyleSheet(
+                    "font-size: 12px; font-weight: bold; color: #a6e3a1;")
+            else:
+                self.mode_label.setText("● 일반 모드")
+                self.mode_label.setStyleSheet(
+                    "font-size: 12px; font-weight: bold; color: #a6adc8;")
+        if hasattr(self, "admin_btn"):
+            self.admin_btn.setText("일반으로" if is_admin else "Admin")
+        if hasattr(self, "pin_change_btn"):
+            self.pin_change_btn.setVisible(is_admin)
+
+    def _toggle_admin_mode(self):
+        """Enter admin mode via PIN, or drop back to general."""
+        if self.role == "admin":
+            self.role = "general"
+            self._apply_role_visibility()
+            self.statusBar().showMessage("일반 모드로 전환했습니다.", 3000)
+            return
+
+        from .pin_dialog import prompt_admin_pin
+        if prompt_admin_pin(self):
+            self.role = "admin"
+            self._apply_role_visibility()
+            self.statusBar().showMessage("Admin 모드를 활성화했습니다.", 3000)
+            if app_config.is_default_pin():
+                QMessageBox.information(
+                    self, "Admin",
+                    "기본 PIN(0000)이 사용 중입니다. 'PIN 변경'으로 변경을 권장합니다.")
+
+    def _change_admin_pin(self):
+        """Change the admin PIN (admin only; re-verifies the current PIN first
+        so a left-open admin session can't be silently re-keyed)."""
+        if self.role != "admin":
+            return
+        from .pin_dialog import prompt_admin_pin, prompt_change_pin
+        if not prompt_admin_pin(self):  # confirm the current PIN holder
+            return
+        if prompt_change_pin(self):
+            self.statusBar().showMessage("Admin PIN을 변경했습니다.", 3000)
+
     def _create_load_panel(self) -> QGroupBox:
         group = QGroupBox("Data Loading")
         layout = QHBoxLayout(group)
@@ -427,6 +504,26 @@ class MainWindow(QMainWindow):
         self.load_btn.setFixedHeight(32)
         self.load_btn.clicked.connect(self._on_load_clicked)
         layout.addWidget(self.load_btn)
+
+        # --- Access mode switcher (general / admin) ---
+        mode_sep = QFrame()
+        mode_sep.setFrameShape(QFrame.VLine)
+        mode_sep.setStyleSheet("color: #45475a;")
+        layout.addWidget(mode_sep)
+
+        self.mode_label = QLabel()
+        self.mode_label.setStyleSheet("font-size: 12px; font-weight: bold;")
+        layout.addWidget(self.mode_label)
+
+        self.pin_change_btn = QPushButton("PIN 변경")
+        self.pin_change_btn.setFixedHeight(32)
+        self.pin_change_btn.clicked.connect(self._change_admin_pin)
+        layout.addWidget(self.pin_change_btn)
+
+        self.admin_btn = QPushButton("Admin")
+        self.admin_btn.setFixedHeight(32)
+        self.admin_btn.clicked.connect(self._toggle_admin_mode)
+        layout.addWidget(self.admin_btn)
 
         return group
 
@@ -540,6 +637,7 @@ class MainWindow(QMainWindow):
         # excludes outlier pixels (analyzer.DEFAULT_OUTLIER_MODE/VALUE).
         self.outlier_mode_combo.setCurrentText("Percentile")
 
+        self.outlier_frame = outlier_frame
         layout.addWidget(outlier_frame)
 
         # Spec Judgment — redesigned with equipment type + dual spec
