@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
     QGroupBox, QLabel, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QCheckBox,
     QFileDialog, QMessageBox, QProgressBar,
     QFrame, QGridLayout, QScrollArea, QSlider,
 )
@@ -309,6 +309,7 @@ class MainWindow(QMainWindow):
         self.qc_widget = self._create_qc_tab()
         self.compare_widget = self._create_compare_tab()
         self.msa_widget = self._create_msa_tab()
+        self.spec_admin_widget = self._create_spec_admin_tab()
         self.remark_widget = self._create_remark_tab()
 
         # Profile Charts wrapper with Y-axis scale toolbar
@@ -383,6 +384,7 @@ class MainWindow(QMainWindow):
         self.quality_tabs.addTab(self.qc_widget, "QC Check")
         self.quality_tabs.addTab(self.compare_widget, "Compare")
         self.quality_tabs.addTab(self.msa_widget, "MSA (Gauge R&R)")
+        self.quality_tabs.addTab(self.spec_admin_widget, "Spec 관리")
 
         # Tools category
         self.tools_tabs = QTabWidget()
@@ -432,9 +434,9 @@ class MainWindow(QMainWindow):
     def _apply_role_visibility(self):
         """Show/hide menus per the active role.
 
-        General (default): standard analysis, judgment and reports.
-        Admin: also exposes data-altering controls — the Flatten tab and the
-        Robust outlier tuning — plus the PIN-change button.
+        General (default): standard analysis, fixed-standard judgment and reports.
+        Admin: also exposes data-altering controls — the Flatten tab, the outlier
+        exclusion threshold, the Quality group (incl. Spec 관리) and PIN change.
         """
         is_admin = self.role == "admin"
 
@@ -450,15 +452,14 @@ class MainWindow(QMainWindow):
                         and hasattr(self, "profile_tab_widget"):
                     self.analysis_tabs.setCurrentWidget(self.profile_tab_widget)
 
-        # Robust outlier tuning — admin only; general stays on the locked preset.
-        if hasattr(self, "outlier_frame"):
-            self.outlier_frame.setEnabled(is_admin)
+        # Outlier exclusion threshold (Summary tab Mode/Value) — admin only. The
+        # "Robust 병기" checkbox itself stays available to everyone.
+        if hasattr(self, "outlier_ctrl_widget"):
+            self.outlier_ctrl_widget.setEnabled(is_admin)
 
-        # Spec preset: everyone may SELECT/load; only admin may add/edit (manage).
-        if hasattr(self, "preset_manage_btn"):
-            self.preset_manage_btn.setVisible(is_admin)
+        # (Spec preset selection/management lives in the admin-only Quality group.)
 
-        # Quality category (QC Check / Compare / MSA) — admin only.
+        # Quality category (QC Check / Compare / MSA / Spec 관리) — admin only.
         if hasattr(self, "tabs") and hasattr(self, "quality_tabs"):
             q_idx = self.tabs.indexOf(self.quality_tabs)
             if q_idx != -1:
@@ -580,6 +581,59 @@ class MainWindow(QMainWindow):
         if dlg.selected_name is not None or self.preset_combo.currentText() != before:
             self._on_preset_changed(self.preset_combo.currentText())
 
+    def _reset_to_standard(self):
+        """Clear any active preset override → judge against the fixed built-in spec."""
+        self.preset_combo.setCurrentText(BUILTIN_PRESET_LABEL)  # → _on_preset_changed
+        if self.current_preset is not None:
+            self.current_preset = None
+            if self.current_recipe:
+                self._run_analysis()
+
+    def _create_spec_admin_tab(self) -> QWidget:
+        """Quality > 'Spec 관리' (admin-only): apply/manage a preset override.
+
+        General users always judge against the fixed built-in standard spec; only
+        here (inside the admin-only Quality group) can the standard be overridden.
+        """
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        title = QLabel("Spec 한계값 관리 (Admin)")
+        title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 13px;")
+        layout.addWidget(title)
+        info = QLabel(
+            "표준 Spec은 고정값입니다. 여기서 프리셋(장비유형·outlier·range별 한계 override·메타)을 "
+            "적용/관리합니다. '표준으로'를 누르면 override를 해제하고 내장 표준 spec으로 판정합니다.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#a6adc8; font-size:11px;")
+        layout.addWidget(info)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("프리셋:"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(220)
+        self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
+        row.addWidget(self.preset_combo, 1)
+        self.preset_manage_btn = QPushButton("관리")
+        self.preset_manage_btn.setFixedWidth(64)
+        self.preset_manage_btn.clicked.connect(self._manage_presets)
+        row.addWidget(self.preset_manage_btn)
+        self.preset_reset_btn = QPushButton("표준으로")
+        self.preset_reset_btn.setFixedWidth(80)
+        self.preset_reset_btn.clicked.connect(self._reset_to_standard)
+        row.addWidget(self.preset_reset_btn)
+        spec_ref_btn = QPushButton("표준 Spec 표")
+        spec_ref_btn.setFixedWidth(104)
+        spec_ref_btn.clicked.connect(self._show_spec_info_popup)
+        row.addWidget(spec_ref_btn)
+        layout.addLayout(row)
+
+        layout.addStretch()
+        self._refresh_preset_combo()
+        return widget
+
     def _create_load_panel(self) -> QGroupBox:
         group = QGroupBox("Data Loading")
         layout = QHBoxLayout(group)
@@ -675,89 +729,11 @@ class MainWindow(QMainWindow):
         best5_inner.addLayout(best5_row)
         layout.addWidget(best5_frame)
 
-        # Outlier Exclusion
-        outlier_frame = QFrame()
-        outlier_frame.setStyleSheet(
-            "QFrame#outlierFrame { border: 1px solid #45475a; border-radius: 6px; }")
-        outlier_frame.setObjectName("outlierFrame")
-        outlier_inner = QVBoxLayout(outlier_frame)
-        outlier_inner.setContentsMargins(10, 6, 10, 8)
-        outlier_inner.setSpacing(4)
-
-        outlier_title = QLabel("Robust 제외 (Raw와 병기)")
-        outlier_title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 12px;")
-        outlier_title.setToolTip(
-            "Raw(전체 데이터)는 항상 표시되고, 여기서 고른 제외 방식으로 계산한 "
-            "Robust 값이 Summary/Spec에 함께 표시됩니다. None이면 Robust 열 없음.")
-        outlier_inner.addWidget(outlier_title)
-
-        outlier_row1 = QHBoxLayout()
-        outlier_row1.addWidget(QLabel("Mode:"))
-        self.outlier_mode_combo = QComboBox()
-        self.outlier_mode_combo.addItems(["None", "Percentile", "Pixels"])
-        self.outlier_mode_combo.setFixedSize(120, 28)
-        self.outlier_mode_combo.setStyleSheet(
-            "QComboBox { background: #1e1e2e; border: 1px solid #45475a; "
-            "border-radius: 4px; padding: 2px 6px; color: #cdd6f4; }")
-        self.outlier_mode_combo.currentTextChanged.connect(self._on_outlier_mode_changed)
-        outlier_row1.addWidget(self.outlier_mode_combo)
-        outlier_row1.addStretch()
-        outlier_inner.addLayout(outlier_row1)
-
-        outlier_row2 = QHBoxLayout()
-        self.outlier_value_label = QLabel("Value:")
-        outlier_row2.addWidget(self.outlier_value_label)
-        self.outlier_value_spin = QDoubleSpinBox()
-        self.outlier_value_spin.setRange(0.0, 100.0)
-        self.outlier_value_spin.setValue(5.0)
-        self.outlier_value_spin.setDecimals(1)
-        self.outlier_value_spin.setSuffix(" %")
-        self.outlier_value_spin.setFixedSize(100, 28)
-        self.outlier_value_spin.setStyleSheet(
-            "QDoubleSpinBox { background: #1e1e2e; border: 1px solid #45475a; "
-            "border-radius: 4px; padding: 2px 6px; color: #cdd6f4; }")
-        self.outlier_value_spin.setEnabled(False)
-        self.outlier_value_spin.valueChanged.connect(self._on_reanalyze)
-        outlier_row2.addWidget(self.outlier_value_spin)
-        outlier_row2.addStretch()
-        outlier_inner.addLayout(outlier_row2)
-
-        # Default to Percentile 1% to match the reference Tool, which always
-        # excludes outlier pixels (analyzer.DEFAULT_OUTLIER_MODE/VALUE).
-        self.outlier_mode_combo.setCurrentText("Percentile")
-
-        self.outlier_frame = outlier_frame
-        layout.addWidget(outlier_frame)
-
-        # Spec / Recipe Preset — load a saved judgment setup (general can select;
-        # only admin can add/edit via the manage dialog).
-        preset_frame = QFrame()
-        preset_frame.setStyleSheet(
-            "QFrame#presetFrame { border: 1px solid #45475a; border-radius: 6px; }")
-        preset_frame.setObjectName("presetFrame")
-        preset_inner = QVBoxLayout(preset_frame)
-        preset_inner.setContentsMargins(10, 6, 10, 8)
-        preset_inner.setSpacing(4)
-        preset_title = QLabel("Spec 프리셋")
-        preset_title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 12px;")
-        preset_title.setToolTip(
-            "저장된 판정 설정(장비유형·outlier·spec override·메타)을 불러옵니다. "
-            "'내장 기본'은 override 없이 기본 spec 표를 사용합니다. 추가/편집은 Admin 전용.")
-        preset_inner.addWidget(preset_title)
-        preset_row = QHBoxLayout()
-        self.preset_combo = QComboBox()
-        self.preset_combo.setStyleSheet(
-            "QComboBox { background: #1e1e2e; border: 1px solid #45475a; "
-            "border-radius: 4px; padding: 2px 6px; color: #cdd6f4; }")
-        self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
-        preset_row.addWidget(self.preset_combo, 1)
-        self.preset_manage_btn = QPushButton("관리")
-        self.preset_manage_btn.setFixedWidth(56)
-        self.preset_manage_btn.clicked.connect(self._manage_presets)
-        preset_row.addWidget(self.preset_manage_btn)
-        preset_inner.addLayout(preset_row)
-        layout.addWidget(preset_frame)
-        self._refresh_preset_combo()
+        # NOTE: the Outlier/Robust control now lives in the Summary Table tab
+        # (_create_summary_table) — it only affects Summary/Spec/Export, not charts.
+        # The Spec preset selector/manager moved to the Quality "Spec 관리" tab
+        # (_create_spec_admin_tab, admin-only). General users judge against the
+        # fixed built-in standard spec.
 
         # Spec Judgment — redesigned with equipment type + dual spec
         spec_frame = QFrame()
@@ -899,27 +875,62 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(_c, QHeaderView.Stretch)
         table.setAlternatingRowColors(True)
         table.setWordWrap(True)
-        # Never elide with "…": metric cells are two lines (raw / robust) and must
+        # Never elide with "…": metric cells can be two lines (raw / robust) and must
         # show in full; eliding collapses them to a single truncated line.
         table.setTextElideMode(Qt.ElideNone)
+        # Display-only: these are analyzed values, never user-editable.
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         # Bigger font for readability
         table.setStyleSheet("""
             QTableWidget { font-size: 13px; }
             QTableWidget::item { padding: 6px; }
             QHeaderView::section { font-size: 13px; padding: 8px; }
         """)
-        # Fixed row height tall enough for the two-line (raw / robust) cells.
         table.verticalHeader().setDefaultSectionSize(50)
         self.summary_table = table
 
-        # Wrap with a legend so the raw/robust dual display is self-explanatory.
         container = QWidget()
         v = QVBoxLayout(container)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(2)
+
+        # --- Control row: Robust 병기 toggle (everyone) + outlier threshold (admin) ---
+        ctrl = QHBoxLayout()
+        ctrl.setContentsMargins(6, 2, 6, 0)
+        ctrl.setSpacing(8)
+        self.summary_show_robust = QCheckBox("Robust 병기")
+        self.summary_show_robust.setToolTip(
+            "반복 간 편차(Max−Min)가 큰 outlier 픽셀을 제외한 Robust 값을 "
+            "RAW 값 아래 함께 표시합니다. (기본: RAW만 표시)")
+        self.summary_show_robust.toggled.connect(self._on_reanalyze)
+        ctrl.addWidget(self.summary_show_robust)
+
+        self.outlier_ctrl_widget = QWidget()  # threshold — gated to admin
+        oc = QHBoxLayout(self.outlier_ctrl_widget)
+        oc.setContentsMargins(0, 0, 0, 0)
+        oc.setSpacing(4)
+        oc.addWidget(QLabel("Outlier 제외:"))
+        self.outlier_mode_combo = QComboBox()
+        self.outlier_mode_combo.addItems(["Percentile", "Pixels"])
+        self.outlier_mode_combo.setFixedSize(110, 26)
+        self.outlier_mode_combo.currentTextChanged.connect(self._on_outlier_mode_changed)
+        oc.addWidget(self.outlier_mode_combo)
+        self.outlier_value_spin = QDoubleSpinBox()
+        self.outlier_value_spin.setRange(0.0, 100.0)
+        self.outlier_value_spin.setValue(1.0)
+        self.outlier_value_spin.setDecimals(1)
+        self.outlier_value_spin.setSuffix(" %")
+        self.outlier_value_spin.setFixedSize(90, 26)
+        self.outlier_value_spin.valueChanged.connect(self._on_reanalyze)
+        oc.addWidget(self.outlier_value_spin)
+        ctrl.addWidget(self.outlier_ctrl_widget)
+        ctrl.addStretch()
+        v.addLayout(ctrl)
+
         legend = QLabel(
-            "각 지표 칸 — 상단: <b>Raw</b>(전체 데이터, 참 측정값) · 하단: "
-            "<b>Robust</b>(outlier 제외). 두 값이 다른 칸은 노랑으로 강조됩니다.")
+            "기본은 <b>Raw</b>(전체 데이터, 참 측정값)만 표시. <b>Robust 병기</b> 체크 시 각 칸 "
+            "하단에 <b>Robust</b>(outlier 픽셀 제외) 값을 함께 표시하고 두 값이 다르면 노랑 강조. "
+            "Outlier = 반복 간 편차(Max−Min)가 큰 픽셀 (임계값 조정은 Admin 전용).")
         legend.setWordWrap(True)
         legend.setStyleSheet("color:#a6adc8; font-size:11px; padding:3px 6px;")
         v.addWidget(legend)
@@ -1227,6 +1238,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(detail_row)
 
         self.qc_detail_table = QTableWidget()
+        self.qc_detail_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.qc_detail_table.setStyleSheet("""
             QTableWidget { font-size: 12px; }
             QTableWidget::item { padding: 4px; }
@@ -2359,14 +2371,12 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _on_outlier_mode_changed(self, text: str):
-        is_active = text != "None"
-        self.outlier_value_spin.setEnabled(is_active)
         if text == "Pixels":
             self.outlier_value_spin.setSuffix("")
             self.outlier_value_spin.setDecimals(0)
             self.outlier_value_spin.setRange(0, 9999)
             self.outlier_value_spin.setValue(10)
-        elif text == "Percentile":
+        else:  # Percentile
             self.outlier_value_spin.setSuffix(" %")
             self.outlier_value_spin.setDecimals(1)
             self.outlier_value_spin.setRange(0.0, 100.0)
@@ -2397,18 +2407,18 @@ class MainWindow(QMainWindow):
             equipment_type=equipment_type,
             outlier_mode="none", outlier_value=0.0,
             spec_overrides=overrides)
-        # Robust companion = outlier-excluded preset from the UI (default Percentile
-        # 1%), shown ALONGSIDE the raw value. "None" -> no companion (mirrors raw).
-        robust_mode = self.outlier_mode_combo.currentText().lower()
-        if robust_mode == "none":
-            self.current_result_robust = None
-        else:
+        # Robust companion = outlier-excluded value shown ALONGSIDE raw, only when
+        # the "Robust 병기" toggle (Summary tab) is on. Off -> raw only (the default).
+        if self.summary_show_robust.isChecked():
+            robust_mode = self.outlier_mode_combo.currentText().lower()
             self.current_result_robust = analyze_recipe(
                 self.current_recipe, window_size=window_size,
                 equipment_type=equipment_type,
                 outlier_mode=robust_mode,
                 outlier_value=self.outlier_value_spin.value(),
                 spec_overrides=overrides)
+        else:
+            self.current_result_robust = None
 
         # Time analysis
         self.current_timing = extract_recipe_timing(self.current_recipe)
@@ -2492,6 +2502,9 @@ class MainWindow(QMainWindow):
             return
         rows = get_dual_summary_table(
             self.current_result, self.current_result_robust, use_best_window=True)
+        # Taller rows only when the 2-line robust value is shown; compact otherwise.
+        two_line = self.current_result_robust is not None
+        self.summary_table.verticalHeader().setDefaultSectionSize(50 if two_line else 30)
         self.summary_table.setRowCount(len(rows))
         metric_keys = ["Rep. Max (nm)", "Rep. 1σ (nm)", "OPM Max (nm)", "OPM 1σ (nm)"]
         cols = ["Range", "Position"] + metric_keys
@@ -2630,6 +2643,7 @@ class MainWindow(QMainWindow):
         self.msa_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.msa_table.verticalHeader().setVisible(False)
         self.msa_table.setAlternatingRowColors(True)
+        self.msa_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.msa_table.setMaximumHeight(240)
         layout.addWidget(self.msa_table)
 
