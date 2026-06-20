@@ -275,7 +275,8 @@ def _evaluate_window(recipe: RecipeData, start: int, count: int,
 def analyze_recipe(recipe: RecipeData, window_size: int = 5,
                    equipment_type: str = "iso",
                    outlier_mode: str = "none",
-                   outlier_value: float = 0.0) -> AnalysisResult:
+                   outlier_value: float = 0.0,
+                   spec_overrides: Optional[dict] = None) -> AnalysisResult:
     """Perform full OPM Repeatability analysis on a recipe.
 
     Args:
@@ -284,6 +285,9 @@ def analyze_recipe(recipe: RecipeData, window_size: int = 5,
         equipment_type: Equipment type - "iso" (Isolated AE / 분리형) or "dw" (Double Walled AE / 일체형).
         outlier_mode: "none", "percentile", or "pixels" for outlier pixel exclusion.
         outlier_value: Threshold for outlier exclusion.
+        spec_overrides: Optional dict {"rep_limit": float, "opm_limit": float} from a
+            saved preset; either key may be None/absent to fall back to the built-in
+            SPEC_* table for this range. None = built-in (backward compatible).
 
     Returns:
         AnalysisResult with per-position stats, Best-5 window, and spec judgment.
@@ -331,8 +335,12 @@ def analyze_recipe(recipe: RecipeData, window_size: int = 5,
     range_mm = recipe.range_mm
     source = best_window.positions if best_window else all_positions
 
+    _ov = spec_overrides or {}
+
     # 1) OPM Repeatability spec (Rep. 1σ)
-    spec_limit = SPEC_REPEATABILITY.get(range_mm)
+    spec_limit = _ov.get("rep_limit")
+    if spec_limit is None:
+        spec_limit = SPEC_REPEATABILITY.get(range_mm)
     spec_pass = None
     spec_value = None
     if spec_limit is not None and source:
@@ -349,7 +357,9 @@ def analyze_recipe(recipe: RecipeData, window_size: int = 5,
 
     # 2) Max OPM spec
     opm_spec_table = SPEC_MAX_OPM_DW if equipment_type == "dw" else SPEC_MAX_OPM_ISO
-    spec_opm_limit = opm_spec_table.get(range_mm)
+    spec_opm_limit = _ov.get("opm_limit")
+    if spec_opm_limit is None:
+        spec_opm_limit = opm_spec_table.get(range_mm)
     spec_opm_pass = None
     spec_opm_value = None
     if spec_opm_limit is not None and source:

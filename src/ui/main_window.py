@@ -45,6 +45,7 @@ from ..core.comparator import compare_results, get_compare_table, CompareResult
 from ..core.analyzer import compute_normalized_opm
 from ..core.flatten import FlattenProcessor
 from ..core import app_config
+from ..core import spec_config
 from ..core.time_analysis import extract_recipe_timing, RecipeTiming, format_timing_summary
 from ..core.ball_screw_analyzer import (
     analyze_ball_screw, BallScrewAnalysisResult, get_dishing_matrix,
@@ -184,6 +185,9 @@ def _detect_folder_type(path: Path, max_depth: int = 3) -> str:
     return "unknown"
 
 
+BUILTIN_PRESET_LABEL = "내장 기본 (override 없음)"
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -206,6 +210,8 @@ class MainWindow(QMainWindow):
         self._loaded_path: Optional[str] = None
         self._block_range_signal = False
         self.role = "general"  # access role: "general" | "admin" (admin gated by PIN)
+        self.current_preset: Optional[dict] = None  # active spec preset (None = built-in)
+        self._applying_preset = False  # guard against re-analysis cascade while loading a preset
 
         # Debounced re-layout of chart canvases on window resize
         self._resize_debounce = QTimer()
@@ -445,6 +451,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "outlier_frame"):
             self.outlier_frame.setEnabled(is_admin)
 
+        # Spec preset: everyone may SELECT/load; only admin may add/edit (manage).
+        if hasattr(self, "preset_manage_btn"):
+            self.preset_manage_btn.setVisible(is_admin)
+
         # Switcher widgets
         if hasattr(self, "mode_label"):
             # BMP bullet (●) instead of an astral-plane lock emoji, which can
@@ -490,6 +500,73 @@ class MainWindow(QMainWindow):
             return
         if prompt_change_pin(self):
             self.statusBar().showMessage("Admin PIN을 변경했습니다.", 3000)
+
+    # ------------------------------------------------------------------
+    # Spec / recipe presets
+    # ------------------------------------------------------------------
+    def _refresh_preset_combo(self, select: Optional[str] = None):
+        """Repopulate the preset combo from storage (signals blocked)."""
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem(BUILTIN_PRESET_LABEL)
+        for p in spec_config.list_presets():
+            self.preset_combo.addItem(p.get("name", ""))
+        if select:
+            i = self.preset_combo.findText(select)
+            if i >= 0:
+                self.preset_combo.setCurrentIndex(i)
+        self.preset_combo.blockSignals(False)
+
+    def _apply_preset(self, preset: dict):
+        """Push a preset's equipment/outlier settings onto the controls without
+        triggering the per-control re-analysis cascade (caller re-analyzes once)."""
+        self._applying_preset = True
+        try:
+            et = preset.get("equipment_type", "iso")
+            (self.radio_dw if et == "dw" else self.radio_iso).setChecked(True)
+            ol = preset.get("outlier") or {}
+            mode = ol.get("mode", "none")
+            self.outlier_mode_combo.setCurrentText(
+                {"none": "None", "percentile": "Percentile", "pixels": "Pixels"}.get(mode, "None"))
+            if mode != "none" and ol.get("value") is not None:
+                self.outlier_value_spin.setValue(float(ol["value"]))
+        finally:
+            self._applying_preset = False
+
+    def _on_preset_changed(self, name: str):
+        """Selecting a preset applies its settings and re-analyzes once."""
+        if self._applying_preset:
+            return
+        if not name or name == BUILTIN_PRESET_LABEL:
+            self.current_preset = None
+        else:
+            self.current_preset = spec_config.get_preset(name)
+            if self.current_preset:
+                self._apply_preset(self.current_preset)
+        if self.current_recipe:
+            self._run_analysis()
+
+    def _manage_presets(self):
+        """Open the admin preset manager, then reflect any changes."""
+        if self.role != "admin":
+            return
+        from .preset_dialog import PresetManagerDialog
+        current = {
+            "equipment_type": "iso" if self.radio_iso.isChecked() else "dw",
+            "outlier": {"mode": self.outlier_mode_combo.currentText().lower(),
+                        "value": float(self.outlier_value_spin.value())},
+            "meta": {},
+        }
+        range_mm = self.current_recipe.range_mm if self.current_recipe else None
+        before = self.preset_combo.currentText()
+        dlg = PresetManagerDialog(self, current, range_mm)
+        dlg.exec()
+        keep = dlg.selected_name or before
+        self._refresh_preset_combo(select=keep)
+        # Only re-apply/re-analyze when the manager actually changed the active
+        # preset; otherwise leave the admin's live (possibly hand-tweaked) state.
+        if dlg.selected_name is not None or self.preset_combo.currentText() != before:
+            self._on_preset_changed(self.preset_combo.currentText())
 
     def _create_load_panel(self) -> QGroupBox:
         group = QGroupBox("Data Loading")
@@ -639,6 +716,36 @@ class MainWindow(QMainWindow):
 
         self.outlier_frame = outlier_frame
         layout.addWidget(outlier_frame)
+
+        # Spec / Recipe Preset — load a saved judgment setup (general can select;
+        # only admin can add/edit via the manage dialog).
+        preset_frame = QFrame()
+        preset_frame.setStyleSheet(
+            "QFrame#presetFrame { border: 1px solid #45475a; border-radius: 6px; }")
+        preset_frame.setObjectName("presetFrame")
+        preset_inner = QVBoxLayout(preset_frame)
+        preset_inner.setContentsMargins(10, 6, 10, 8)
+        preset_inner.setSpacing(4)
+        preset_title = QLabel("Spec 프리셋")
+        preset_title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 12px;")
+        preset_title.setToolTip(
+            "저장된 판정 설정(장비유형·outlier·spec override·메타)을 불러옵니다. "
+            "'내장 기본'은 override 없이 기본 spec 표를 사용합니다. 추가/편집은 Admin 전용.")
+        preset_inner.addWidget(preset_title)
+        preset_row = QHBoxLayout()
+        self.preset_combo = QComboBox()
+        self.preset_combo.setStyleSheet(
+            "QComboBox { background: #1e1e2e; border: 1px solid #45475a; "
+            "border-radius: 4px; padding: 2px 6px; color: #cdd6f4; }")
+        self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
+        preset_row.addWidget(self.preset_combo, 1)
+        self.preset_manage_btn = QPushButton("관리")
+        self.preset_manage_btn.setFixedWidth(56)
+        self.preset_manage_btn.clicked.connect(self._manage_presets)
+        preset_row.addWidget(self.preset_manage_btn)
+        preset_inner.addLayout(preset_row)
+        layout.addWidget(preset_frame)
+        self._refresh_preset_combo()
 
         # Spec Judgment — redesigned with equipment type + dual spec
         spec_frame = QFrame()
@@ -1332,7 +1439,7 @@ class MainWindow(QMainWindow):
             signal = self.source_combo.currentText()
             ref_recipe = load_recipe(ref_path, signal_source=signal)
 
-            equipment_type = "dw" if self.equip_dw_radio.isChecked() else "iso"
+            equipment_type = "dw" if self.radio_dw.isChecked() else "iso"
             window_size = self.window_spin.value()
             outlier_mode = self.outlier_mode_combo.currentText().lower()
             outlier_value = self.outlier_value_spin.value() if outlier_mode != "none" else 0.0
@@ -2134,7 +2241,7 @@ class MainWindow(QMainWindow):
 
     def _on_equipment_changed(self):
         """Re-analyze when equipment type radio is toggled."""
-        if self.current_recipe:
+        if self.current_recipe and not self._applying_preset:
             self._run_analysis()
 
     def _show_spec_info_popup(self):
@@ -2231,10 +2338,11 @@ class MainWindow(QMainWindow):
             self.outlier_value_spin.setDecimals(1)
             self.outlier_value_spin.setRange(0.0, 100.0)
             self.outlier_value_spin.setValue(1.0)
-        self._on_reanalyze()
+        if not self._applying_preset:
+            self._on_reanalyze()
 
     def _on_reanalyze(self):
-        if self.current_recipe:
+        if self.current_recipe and not self._applying_preset:
             self._run_analysis()
 
     # ─── Analysis ────────────────────────────────────────────
@@ -2245,12 +2353,17 @@ class MainWindow(QMainWindow):
 
         window_size = self.window_spin.value()
         equipment_type = "iso" if self.radio_iso.isChecked() else "dw"
+        # Spec-limit overrides from the active preset for this recipe's range
+        # (None = built-in SPEC_* tables).
+        overrides = spec_config.resolve_overrides(
+            self.current_preset, self.current_recipe.range_mm)
         # Raw = the true measurement (no outlier exclusion) — the honest headline
         # used by all charts / wafer map / detail dialog.
         self.current_result = analyze_recipe(
             self.current_recipe, window_size=window_size,
             equipment_type=equipment_type,
-            outlier_mode="none", outlier_value=0.0)
+            outlier_mode="none", outlier_value=0.0,
+            spec_overrides=overrides)
         # Robust companion = outlier-excluded preset from the UI (default Percentile
         # 1%), shown ALONGSIDE the raw value. "None" -> no companion (mirrors raw).
         robust_mode = self.outlier_mode_combo.currentText().lower()
@@ -2261,7 +2374,8 @@ class MainWindow(QMainWindow):
                 self.current_recipe, window_size=window_size,
                 equipment_type=equipment_type,
                 outlier_mode=robust_mode,
-                outlier_value=self.outlier_value_spin.value())
+                outlier_value=self.outlier_value_spin.value(),
+                spec_overrides=overrides)
 
         # Time analysis
         self.current_timing = extract_recipe_timing(self.current_recipe)
@@ -2391,11 +2505,26 @@ class MainWindow(QMainWindow):
 
         rr = self.current_result_robust  # outlier-excluded companion (may be None)
 
+        # Effective spec source: a preset overrides limits PER RANGE, so when an
+        # active preset has no override for this recipe's range the judgment quietly
+        # uses the built-in table. Surface the preset name and per-limit source so
+        # the operator is never misled into thinking the preset's spec is in force.
+        ov = (spec_config.resolve_overrides(self.current_preset, r.range_mm)
+              if self.current_preset else None)
+        if self.current_preset:
+            lines.append(f"<b>Preset:</b> {self.current_preset.get('name', '')}")
+            if ov is None:
+                lines.append("<span style='color:#f9e2af'>\u26a0 \uc774 range\ub294 \ud504\ub9ac\uc14b "
+                             "override \uc5c6\uc74c \u2014 \uae30\ubcf8 spec \uc801\uc6a9</span>")
+
         # OPM Repeatability (Rep. 1\u03c3) \u2014 raw, with robust shown alongside
         if r.spec_limit is not None:
             val_str = f"{r.spec_value:.3f}" if r.spec_value is not None else "N/A"
             pass_icon = "\u2705" if r.spec_pass else "\u274c"
             line = f"{pass_icon} <b>Rep. 1\u03c3:</b> {val_str} / {r.spec_limit} nm"
+            if self.current_preset:
+                src = "\ud504\ub9ac\uc14b" if (ov and ov.get("rep_limit") is not None) else "\uae30\ubcf8"
+                line += f" <span style='color:#a6adc8'>[{src}]</span>"
             if rr is not None and rr.spec_value is not None:
                 rob_icon = "\u2705" if rr.spec_pass else "\u274c"
                 line += (f"  <span style='color:#a6adc8'>(robust {rob_icon} "
@@ -2408,6 +2537,9 @@ class MainWindow(QMainWindow):
             val_str = f"{r.spec_opm_value:.3f}" if r.spec_opm_value is not None else "N/A"
             pass_icon = "\u2705" if r.spec_opm_pass else "\u274c"
             line = f"{pass_icon} <b>OPM Max:</b> {val_str} / {r.spec_opm_limit} nm"
+            if self.current_preset:
+                src = "\ud504\ub9ac\uc14b" if (ov and ov.get("opm_limit") is not None) else "\uae30\ubcf8"
+                line += f" <span style='color:#a6adc8'>[{src}]</span>"
             if rr is not None and rr.spec_opm_value is not None:
                 rob_icon = "\u2705" if rr.spec_opm_pass else "\u274c"
                 line += (f"  <span style='color:#a6adc8'>(robust {rob_icon} "

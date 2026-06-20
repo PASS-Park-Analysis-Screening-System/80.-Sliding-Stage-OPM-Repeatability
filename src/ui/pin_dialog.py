@@ -11,6 +11,18 @@ from PySide6.QtWidgets import (
 
 from ..core import app_config
 
+# Child QDialogs don't inherit the MainWindow stylesheet (set per-widget, not
+# app-wide), so carry a compact dark theme to match the app.
+_DIALOG_QSS = (
+    "QDialog { background-color: #1e1e2e; }"
+    "QLabel { color: #cdd6f4; font-size: 12px; }"
+    "QLineEdit { background-color: #181825; color: #cdd6f4;"
+    " border: 1px solid #45475a; border-radius: 4px; padding: 4px; }"
+    "QPushButton { background-color: #313244; color: #cdd6f4;"
+    " border: 1px solid #45475a; border-radius: 4px; padding: 6px 14px; }"
+    "QPushButton:hover { background-color: #45475a; }"
+)
+
 
 class _PinDialog(QDialog):
     """Single password-style PIN entry with an inline error line."""
@@ -20,6 +32,7 @@ class _PinDialog(QDialog):
         self.setWindowTitle(title)
         self.setModal(True)
         self.setMinimumWidth(280)
+        self.setStyleSheet(_DIALOG_QSS)
 
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(prompt))
