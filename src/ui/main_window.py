@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont, QColor, QShortcut, QKeySequence, QGuiApplication
+from PySide6.QtGui import (QFont, QColor, QShortcut, QKeySequence, QGuiApplication,
+                           QTextDocument, QAbstractTextDocumentLayout, QTextOption)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QCheckBox,
     QFileDialog, QMessageBox, QProgressBar,
     QFrame, QGridLayout, QScrollArea, QSlider,
+    QStyledItemDelegate, QStyleOptionViewItem, QStyle,
 )
 import matplotlib
 matplotlib.use("QtAgg")
@@ -186,6 +188,35 @@ def _detect_folder_type(path: Path, max_depth: int = 3) -> str:
 
 
 BUILTIN_PRESET_LABEL = "내장 기본 (override 없음)"
+
+
+class _HtmlDelegate(QStyledItemDelegate):
+    """Render a cell's DisplayRole as centered rich HTML, preserving the item's
+    background / selection. Used for the Summary metric cells so the right
+    ("이상치 제외값") number can be colored independently of the left one."""
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        html = opt.text
+        opt.text = ""
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+
+        doc = QTextDocument()
+        doc.setDefaultFont(opt.font)
+        to = QTextOption()
+        to.setAlignment(Qt.AlignCenter)
+        to.setWrapMode(QTextOption.NoWrap)  # keep "기본값 / 이상치 제외값" on one line
+        doc.setDefaultTextOption(to)
+        doc.setHtml(html)
+        doc.setTextWidth(opt.rect.width())
+
+        painter.save()
+        y = opt.rect.top() + max(0.0, (opt.rect.height() - doc.size().height()) / 2.0)
+        painter.translate(opt.rect.left(), y)
+        doc.documentLayout().draw(painter, QAbstractTextDocumentLayout.PaintContext())
+        painter.restore()
 
 
 class MainWindow(QMainWindow):
@@ -886,7 +917,12 @@ class MainWindow(QMainWindow):
             QTableWidget::item { padding: 6px; }
             QHeaderView::section { font-size: 13px; padding: 8px; }
         """)
-        table.verticalHeader().setDefaultSectionSize(50)
+        table.verticalHeader().setDefaultSectionSize(34)  # single-line "기본값 / 이상치 제외값"
+        # Metric columns render rich HTML so the right (이상치 제외값) number can be
+        # colored independently; Range/Position keep the default plain rendering.
+        self._summary_html_delegate = _HtmlDelegate(table)
+        for _c in range(2, 6):
+            table.setItemDelegateForColumn(_c, self._summary_html_delegate)
         self.summary_table = table
 
         container = QWidget()
@@ -948,8 +984,9 @@ class MainWindow(QMainWindow):
         v.addLayout(ctrl)
 
         legend = QLabel(
-            "기본은 <b>Raw</b>(전체 데이터, 참 측정값)만 표시. <b>이상치 제외값 병기</b> 체크 시 각 칸 "
-            "하단에 <b>이상치 제외값</b>(이상 픽셀 제외)을 함께 표시하고 두 값이 다르면 노랑 강조. "
+            "각 칸 = <b>기본값 / 이상치 제외값</b>(이상 픽셀 제외). 우측 색은 <b>Rep.1σ·OPM Max</b>만 — "
+            "<span style='color:#a6e3a1'>초록=Spec 한계 이내</span> · <span style='color:#f38ba8'>빨강=초과</span> "
+            "(Rep.Max·OPM 1σ는 한계 없어 중립). <b>공식 합격/불합격은 Spec 패널의 집계 기준</b>. "
             "이상치 = 반복 간 편차(Max−Min)가 큰 픽셀 (ⓘ로 확인 · 임계값 조정은 Admin).")
         legend.setWordWrap(True)
         legend.setStyleSheet("color:#a6adc8; font-size:11px; padding:3px 6px;")
@@ -2559,38 +2596,58 @@ class MainWindow(QMainWindow):
             return
         rows = get_dual_summary_table(
             self.current_result, self.current_result_robust, use_best_window=True)
-        # Taller rows only when the 2-line robust value is shown; compact otherwise.
-        two_line = self.current_result_robust is not None
-        self.summary_table.verticalHeader().setDefaultSectionSize(50 if two_line else 30)
+        self.summary_table.verticalHeader().setDefaultSectionSize(34)
         self.summary_table.setRowCount(len(rows))
         metric_keys = ["Rep. Max (nm)", "Rep. 1σ (nm)", "OPM Max (nm)", "OPM 1σ (nm)"]
         cols = ["Range", "Position"] + metric_keys
+        # Effective spec limits (preset override honored) — only these two metrics
+        # have a limit, so only their 이상치 제외값 gets a green/red cue.
+        limit_for = {
+            "Rep. 1σ (nm)": self.current_result.spec_limit,
+            "OPM Max (nm)": self.current_result.spec_opm_limit,
+        }
+        BASE, GREEN, RED, NEUTRAL = "#cdd6f4", "#a6e3a1", "#f38ba8", "#a6adc8"
         for i, row in enumerate(rows):
             is_total = row.get("Range") == "Total"
             is_group = row.get("Range") == "Group"
+            bold = is_total or is_group
             for j, key in enumerate(cols):
-                differ = False
                 if key in metric_keys:
                     raw = row.get(key, "")
                     rob = row.get(f"{key} (rob)", raw)
-                    # Show raw on top and robust below only where they differ.
-                    differ = (self.current_result_robust is not None
-                              and rob != "-" and str(rob) != str(raw))
-                    text = f"{raw}\n{rob}" if differ else f"{raw}"
+                    show_rob = (self.current_result_robust is not None
+                                and rob != "-" and str(rob) != str(raw))
+                    if show_rob:
+                        rcol = NEUTRAL
+                        lim = limit_for.get(key)
+                        if lim is not None:
+                            try:
+                                rcol = GREEN if float(rob) <= float(lim) else RED
+                            except (TypeError, ValueError):
+                                rcol = NEUTRAL
+                        html = (f"<span style='color:{BASE}'>{raw} / </span>"
+                                f"<span style='color:{rcol}'>{rob}</span>")
+                    else:
+                        html = f"<span style='color:{BASE}'>{raw}</span>"
+                    if bold:
+                        html = f"<b>{html}</b>"
+                    item = QTableWidgetItem(html)
+                    if is_total:
+                        item.setBackground(QColor("#313244"))
+                    elif is_group:
+                        item.setBackground(QColor("#1e1e2e"))
+                    self.summary_table.setItem(i, j, item)
                 else:
-                    text = str(row.get(key, ""))
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(Qt.AlignCenter)
-                if is_total:
-                    item.setBackground(QColor("#313244"))
-                    item.setFont(QFont("Segoe UI", 11, QFont.Bold))
-                elif is_group:
-                    item.setBackground(QColor("#1e1e2e"))
-                    item.setForeground(QColor("#f9e2af"))
-                    item.setFont(QFont("Segoe UI", 11, QFont.Bold))
-                if differ and not is_group:
-                    item.setForeground(QColor("#f9e2af"))  # raw≠robust -> highlight
-                self.summary_table.setItem(i, j, item)
+                    item = QTableWidgetItem(str(row.get(key, "")))
+                    item.setTextAlignment(Qt.AlignCenter)
+                    if is_total:
+                        item.setBackground(QColor("#313244"))
+                        item.setFont(QFont("Segoe UI", 11, QFont.Bold))
+                    elif is_group:
+                        item.setBackground(QColor("#1e1e2e"))
+                        item.setForeground(QColor("#f9e2af"))
+                        item.setFont(QFont("Segoe UI", 11, QFont.Bold))
+                    self.summary_table.setItem(i, j, item)
 
     def _update_spec_display(self):
         """Update spec judgment with dual-spec values and overall verdict."""
