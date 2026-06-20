@@ -1552,6 +1552,17 @@ class MainWindow(QMainWindow):
         self.export_btn.setEnabled(False)
         export_layout.addWidget(self.export_btn)
 
+        self.pdf_report_btn = QPushButton("검수 리포트 (PDF)")
+        self.pdf_report_btn.setFixedHeight(40)
+        self.pdf_report_btn.setStyleSheet(
+            "QPushButton { background-color: #40a02b; color: white;"
+            "font-weight: bold; font-size: 14px; border-radius: 6px; }"
+            "QPushButton:hover { background-color: #50c03b; }"
+            "QPushButton:disabled { background-color: #45475a; color: #6c7086; }")
+        self.pdf_report_btn.clicked.connect(self._on_pdf_report)
+        self.pdf_report_btn.setEnabled(False)
+        export_layout.addWidget(self.pdf_report_btn)
+
         layout.addWidget(export_frame)
 
         # Split-Pane Guide: Left menu + Right content
@@ -2406,6 +2417,7 @@ class MainWindow(QMainWindow):
         self._clear_compare_tab()
 
         self.export_btn.setEnabled(True)
+        self.pdf_report_btn.setEnabled(True)
 
         bw = self.current_result.best_window
         spec_text = ""
@@ -2666,7 +2678,7 @@ class MainWindow(QMainWindow):
         ax.set_xticks(range(len(positions)))
         ax.set_xticklabels(positions, rotation=45, ha="right", fontsize=8)
         ax.set_ylabel("OPM (nm)")
-        ax.set_title("Position별 평균 OPM ± repeat σ")
+        ax.set_title("Mean OPM ± repeat σ per position")
         ax.tick_params(colors="#cdd6f4")
         ax.yaxis.label.set_color("#cdd6f4")
         ax.title.set_color("#cdd6f4")
@@ -3172,6 +3184,54 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Exported {rl} to {folder}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
+
+    def _on_pdf_report(self):
+        """Generate the formal one-click PDF inspection report."""
+        if not self.current_result or not self.current_recipe:
+            return
+        from datetime import datetime
+        from ..visualization.pdf_report import build_inspection_report
+
+        rl = self.current_result.range_label
+        fpath, _ = QFileDialog.getSaveFileName(
+            self, "검수 리포트 저장", f"inspection_{rl}.pdf", "PDF (*.pdf)")
+        if not fpath:
+            return
+        if Path(fpath).suffix.lower() != ".pdf":
+            fpath = str(Path(fpath).with_suffix(".pdf"))
+
+        try:
+            pmeta = (self.current_preset or {}).get("meta", {}) or {}
+            lots, dates = [], []
+            for rep in self.current_recipe.repeats:
+                lid = getattr(rep, "lot_id", "") or getattr(rep, "sample_id", "")
+                if lid and lid not in lots:
+                    lots.append(lid)
+                dates += [p.date for p in rep.points if getattr(p, "date", "")]
+            if dates:
+                lo, hi = min(dates), max(dates)
+                measured = lo if lo == hi else f"{lo} ~ {hi}"
+            else:
+                measured = "측정일 미기록"
+            meta = {
+                "equipment_id": pmeta.get("equipment_id") or "—",
+                "author": pmeta.get("author") or "—",
+                "signal": self.source_combo.currentText(),
+                "measured": measured,
+                "analyzed": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "lot": ", ".join(lots[:4]) if lots else "—",
+                "tool_version": "OPM Analyzer",
+            }
+            build_inspection_report(
+                self.current_result, fpath,
+                robust_result=self.current_result_robust,
+                msa_result=self.current_msa_result,
+                qc_result=self.current_qc_result,
+                meta=meta)
+            QMessageBox.information(self, "검수 리포트", f"저장 완료:\n{fpath}")
+            self.statusBar().showMessage(f"검수 리포트 저장: {fpath}")
+        except Exception as e:
+            QMessageBox.critical(self, "리포트 오류", str(e))
 
 
 def run_app():
