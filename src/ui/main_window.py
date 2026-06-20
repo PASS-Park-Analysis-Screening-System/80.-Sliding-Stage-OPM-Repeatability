@@ -889,17 +889,27 @@ class MainWindow(QMainWindow):
             "Range", "Position", "Rep. Max (nm)", "Rep. 1σ (nm)",
             "OPM Max (nm)", "OPM 1σ (nm)"
         ])
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        header = table.horizontalHeader()
+        # Range/Position only hold short labels — fit them to content and give the
+        # freed width to the four metric columns so the 2-line raw/robust values
+        # are fully visible instead of being elided.
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Range
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # Position
+        for _c in range(2, 6):
+            header.setSectionResizeMode(_c, QHeaderView.Stretch)
         table.setAlternatingRowColors(True)
         table.setWordWrap(True)
+        # Never elide with "…": metric cells are two lines (raw / robust) and must
+        # show in full; eliding collapses them to a single truncated line.
+        table.setTextElideMode(Qt.ElideNone)
         # Bigger font for readability
         table.setStyleSheet("""
             QTableWidget { font-size: 13px; }
             QTableWidget::item { padding: 6px; }
             QHeaderView::section { font-size: 13px; padding: 8px; }
         """)
-        # Taller rows so each metric cell can show two lines (raw / robust).
-        table.verticalHeader().setDefaultSectionSize(46)
+        # Fixed row height tall enough for the two-line (raw / robust) cells.
+        table.verticalHeader().setDefaultSectionSize(50)
         self.summary_table = table
 
         # Wrap with a legend so the raw/robust dual display is self-explanatory.
