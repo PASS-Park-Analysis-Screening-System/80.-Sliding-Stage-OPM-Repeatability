@@ -18,7 +18,8 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import (QFont, QColor, QShortcut, QKeySequence, QGuiApplication,
-                           QTextDocument, QAbstractTextDocumentLayout, QTextOption)
+                           QTextDocument, QAbstractTextDocumentLayout, QTextOption,
+                           QFontMetrics)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QTreeWidget, QTreeWidgetItem,
@@ -59,6 +60,7 @@ from ..visualization.plot_manager import (
     create_saturation_trend_figure,
     create_wafer_map_figure,
     create_best5_comparison_figure,
+    create_spatial_wafer_map_figure,
 )
 from ..visualization.report_generator import (
     export_summary_csv, export_avg_line_csv, export_all_lines_csv, export_checklist,
@@ -72,7 +74,7 @@ QGroupBox { border: 1px solid #45475a; border-radius: 6px; margin-top: 8px;
             padding-top: 14px; font-weight: bold; color: #89b4fa; }
 QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
 QPushButton { background-color: #313244; color: #cdd6f4; border: 1px solid #45475a;
-              border-radius: 4px; padding: 6px 16px; font-size: 12px;
+              border-radius: 4px; padding: 6px 16px; font-size: 15px;
               min-width: 60px; min-height: 24px; }
 QPushButton:hover { background-color: #45475a; border: 1px solid #89b4fa; }
 QPushButton:pressed { background-color: #585b70; }
@@ -91,7 +93,7 @@ QSpinBox, QDoubleSpinBox { background-color: #313244; color: #cdd6f4;
 QTabWidget::pane { border: 1px solid #45475a; background-color: #1e1e2e; }
 QTabBar::tab { background-color: #313244; color: #a6adc8; padding: 8px 16px;
                border: 1px solid #45475a; border-bottom: none; border-radius: 4px 4px 0 0;
-               font-size: 12px; }
+               font-size: 15px; }
 QTabBar::tab:selected { background-color: #1e1e2e; color: #89b4fa;
                          border-bottom: 2px solid #89b4fa; }
 QTabBar::tab:hover { background-color: #45475a; }
@@ -276,6 +278,9 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        # Keep the elided data path in sync with the (possibly resized) panel width.
+        if getattr(self, "_data_path_full", None):
+            self._set_data_path(self._data_path_full)
         # Debounce: reflow chart labels to the new size after resizing settles.
         if hasattr(self, "_resize_debounce"):
             self._resize_debounce.start()
@@ -283,6 +288,7 @@ class MainWindow(QMainWindow):
     def _relayout_visible_canvas(self):
         """Re-run tight_layout + redraw on visible chart canvases so labels reflow."""
         for name in ("profile_canvas", "trend_canvas", "wafer_canvas",
+                     "spatial_canvas",
                      "best5_canvas", "res_compare_canvas", "flatten_canvas",
                      "bs_bar_canvas", "bs_heatmap_canvas"):
             canvas = getattr(self, name, None)
@@ -300,30 +306,36 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setContentsMargins(8, 8, 8, 0)
 
-        # Top: Data Loading
-        load_group = self._create_load_panel()
-        layout.addWidget(load_group)
-
-        # Main: Splitter (Settings | Tabs)
+        # Main: Splitter (Left column [Data Loading + Settings] | Tabs)
         self.main_splitter = QSplitter(Qt.Horizontal)
 
-        # Left: Settings (scrollable so content never clips on short screens)
+        # Left column: Data Loading (top, always visible) + scrollable Settings.
+        # Data Loading lives here (not a full-width top bar) to free vertical space
+        # for the right-hand tabs (e.g. the taller Summary Table legend).
+        load_group = self._create_load_panel()
         self.settings_widget = self._create_settings_panel()
         self.settings_scroll = QScrollArea()
         self.settings_scroll.setWidget(self.settings_widget)
         self.settings_scroll.setWidgetResizable(True)
         self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.settings_scroll.setFrameShape(QFrame.NoFrame)
-        self.main_splitter.addWidget(self.settings_scroll)
+
+        left_container = QWidget()
+        left_col = QVBoxLayout(left_container)
+        left_col.setContentsMargins(0, 0, 0, 0)
+        left_col.setSpacing(6)
+        left_col.addWidget(load_group)
+        left_col.addWidget(self.settings_scroll, 1)
+        self.main_splitter.addWidget(left_container)
 
         # Right: Category Tabs (2-level nested QTabWidget)
         self.tabs = QTabWidget()
-        self.tabs.setMinimumWidth(600)
+        self.tabs.setMinimumWidth(750)
 
         # -- Category tab styling (outer tabs: larger, with icons) --
         self.tabs.setStyleSheet("""
             QTabWidget > QTabBar::tab {
-                font-size: 13px; font-weight: bold; padding: 10px 20px;
+                font-size: 16px; font-weight: bold; padding: 10px 20px;
             }
         """)
 
@@ -333,6 +345,7 @@ class MainWindow(QMainWindow):
         self.flatten_widget = self._create_flatten_tab()
         self.trend_canvas = FigureCanvas(Figure(figsize=(10, 6)))
         self.wafer_canvas = FigureCanvas(Figure(figsize=(8, 7)))
+        self.spatial_canvas = FigureCanvas(Figure(figsize=(8, 7)))
         self.best5_canvas = FigureCanvas(Figure(figsize=(12, 6)))
         self.time_widget = self._create_time_tab()
         self.bs_widget = self._create_ball_screw_tab()
@@ -352,14 +365,28 @@ class MainWindow(QMainWindow):
         _toolbar.addWidget(QLabel("Y-Axis:"))
         self.y_scale_combo = QComboBox()
         self.y_scale_combo.addItems(["Auto", "Unified", "Group"])
-        self.y_scale_combo.setFixedWidth(110)
+        self.y_scale_combo.setFixedWidth(138)
+        # Per-mode tooltips: overall (hover the box) + per-item (hover dropdown rows)
+        self.y_scale_combo.setToolTip(
+            "Y축 스케일 모드\n"
+            "• Auto: 각 차트가 데이터에 맞춰 Y축을 개별 자동 스케일 (기본)\n"
+            "• Unified: 9개 차트의 Y축 범위를 하나로 통일\n"
+            "• Group: Center/Side/Edge 그룹별로 Y축 범위를 통일")
+        _y_tips = [
+            "각 포지션 차트가 데이터에 맞춰 Y축을 개별 자동 스케일 (기본값). "
+            "포지션별 형상(굴곡) 관찰에 적합.",
+            "9개 차트의 Y축 범위를 하나로 통일. 포지션 간 진폭(높이) 직접 비교에 적합.",
+            "Center/Side/Edge 그룹별로 Y축 범위를 통일. 그룹 내 비교와 그룹 간 차이를 균형 있게.",
+        ]
+        for _i, _tip in enumerate(_y_tips):
+            self.y_scale_combo.setItemData(_i, _tip, Qt.ToolTipRole)
         self.y_scale_combo.currentTextChanged.connect(self._update_profile_chart)
         _toolbar.addWidget(self.y_scale_combo)
 
         # Separator
         _sep = QFrame()
         _sep.setFrameShape(QFrame.VLine)
-        _sep.setFixedHeight(20)
+        _sep.setFixedHeight(25)
         _toolbar.addWidget(_sep)
 
         # Resolution simulation slider
@@ -368,7 +395,7 @@ class MainWindow(QMainWindow):
         self.res_slider.setMinimum(1)
         self.res_slider.setMaximum(1)  # Updated when recipe loads
         self.res_slider.setValue(1)
-        self.res_slider.setFixedWidth(200)
+        self.res_slider.setFixedWidth(250)
         self.res_slider.setToolTip("Simulate lower resolution by block-averaging pixels")
         # Debounced connection: update label immediately, but defer chart redraw
         self._res_debounce = QTimer()
@@ -378,10 +405,10 @@ class MainWindow(QMainWindow):
         self.res_slider.valueChanged.connect(self._on_res_slider_changed)
         _toolbar.addWidget(self.res_slider)
         self.res_slider_label = QLabel("Original")
-        self.res_slider_label.setFixedWidth(160)
+        self.res_slider_label.setFixedWidth(200)
         _toolbar.addWidget(self.res_slider_label)
         self.res_reset_btn = QPushButton("Reset")
-        self.res_reset_btn.setFixedWidth(50)
+        self.res_reset_btn.setFixedWidth(63)
         self.res_reset_btn.clicked.connect(lambda: self.res_slider.setValue(1))
         _toolbar.addWidget(self.res_reset_btn)
 
@@ -391,7 +418,7 @@ class MainWindow(QMainWindow):
 
         # Inner tab style (compact)
         _inner_tab_style = """
-            QTabBar::tab { font-size: 12px; padding: 6px 14px; }
+            QTabBar::tab { font-size: 15px; padding: 6px 14px; }
         """
 
         # Analysis category
@@ -408,6 +435,47 @@ class MainWindow(QMainWindow):
         self.viz_tabs.addTab(self.trend_canvas, "Saturation Trend")
         self.viz_tabs.addTab(self.wafer_canvas, "Wafer Map")
         self.viz_tabs.addTab(self.res_compare_canvas, "Resolution Compare")
+
+        # Admin-only spatial view: real stage-XY scatter + coordinate/value table.
+        self.spatial_tab = QWidget()
+        _spv = QHBoxLayout(self.spatial_tab)
+        _spv.setContentsMargins(0, 0, 0, 0)
+        _spv.setSpacing(6)
+        _spv.addWidget(self.spatial_canvas, 1)
+        self.spatial_table = QTableWidget()
+        self.spatial_table.setColumnCount(5)
+        self.spatial_table.setHorizontalHeaderLabels(
+            ["Position", "X (mm)", "Y (mm)", "OPM Max (nm)", "Rep. Max (nm)"])
+        self.spatial_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.spatial_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.spatial_table.verticalHeader().setVisible(False)
+        self.spatial_table.setFixedWidth(338)
+        self.spatial_table.horizontalHeader().setStretchLastSection(True)
+        self.spatial_table.setStyleSheet(
+            "QTableWidget { background-color: #181825; color: #cdd6f4;"
+            " gridline-color: #45475a; border: 1px solid #45475a; font-size: 13px; }"
+            "QHeaderView::section { background-color: #313244; color: #89b4fa;"
+            " padding: 4px; border: 1px solid #45475a; font-weight: bold; }")
+        _spv.addWidget(self.spatial_table)
+        self.viz_tabs.addTab(self.spatial_tab, "Spatial Map")
+
+        # ⓘ context help on the Visualization tab bar — explains the current chart
+        # (reuses the Guide's content as the single source).
+        from PySide6.QtWidgets import QStyle
+        from PySide6.QtCore import QSize
+        self.viz_help_btn = QPushButton()
+        self.viz_help_btn.setIcon(self.style().standardIcon(
+            QStyle.StandardPixmap.SP_MessageBoxInformation))
+        self.viz_help_btn.setIconSize(QSize(18, 18))
+        self.viz_help_btn.setFixedSize(26, 26)
+        self.viz_help_btn.setCursor(Qt.WhatsThisCursor)
+        self.viz_help_btn.setToolTip("현재 차트 설명 보기")
+        self.viz_help_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none;"
+            " min-width: 0px; min-height: 0px; }"
+            "QPushButton:hover { background: #181825; border-radius: 11px; }")
+        self.viz_help_btn.clicked.connect(self._show_viz_help_popup)
+        self.viz_tabs.setCornerWidget(self.viz_help_btn, Qt.TopRightCorner)
 
         # Quality category
         self.quality_tabs = QTabWidget()
@@ -445,7 +513,7 @@ class MainWindow(QMainWindow):
         # Status Bar
         self.statusBar().showMessage("Ready. Select a data folder to begin.")
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumWidth(200)
+        self.progress_bar.setMaximumWidth(250)
         self.progress_bar.setVisible(False)
         self.statusBar().addPermanentWidget(self.progress_bar)
 
@@ -488,6 +556,15 @@ class MainWindow(QMainWindow):
         if hasattr(self, "outlier_ctrl_widget"):
             self.outlier_ctrl_widget.setEnabled(is_admin)
 
+        # ⓘ outlier help: general gets a basic "what is an outlier" popup; admin gets
+        # the full per-position diagnostic. Reflect that in the hover tooltip.
+        if hasattr(self, "outlier_help_btn"):
+            self.outlier_help_btn.setToolTip(
+                "포지션별 이상치 진단 — 어디서·몇 번 반복에서 났는지, "
+                "일시적(파티클/글리치) vs 구조적(척/볼스크류) 감별 (참고용)"
+                if is_admin else
+                "이상치(제외 픽셀)가 무엇인지 현재 데이터로 보기")
+
         # (Spec preset selection/management lives in the admin-only Quality group.)
 
         # Quality category (QC Check / Compare / MSA / Spec 관리) — admin only.
@@ -499,40 +576,47 @@ class MainWindow(QMainWindow):
                 if not is_admin and self.tabs.currentWidget() is self.quality_tabs:
                     self.tabs.setCurrentIndex(0)
 
-        # Switcher widgets
-        if hasattr(self, "mode_label"):
-            # BMP bullet (●) instead of an astral-plane lock emoji, which can
-            # render as tofu on some Windows Qt fonts; color carries the state.
-            if is_admin:
-                self.mode_label.setText("● Admin 모드")
-                self.mode_label.setStyleSheet(
-                    "font-size: 12px; font-weight: bold; color: #a6e3a1;")
-            else:
-                self.mode_label.setText("● 일반 모드")
-                self.mode_label.setStyleSheet(
-                    "font-size: 12px; font-weight: bold; color: #a6adc8;")
-        if hasattr(self, "admin_btn"):
-            self.admin_btn.setText("일반으로" if is_admin else "Admin")
+        # Spatial Map — admin-only deep spatial view (general users found deep
+        # diagnostics confusing when spec is already IN).
+        if hasattr(self, "viz_tabs"):
+            _w = getattr(self, "spatial_tab", None)
+            if _w is not None:
+                _vi = self.viz_tabs.indexOf(_w)
+                if _vi != -1:
+                    self.viz_tabs.setTabVisible(_vi, is_admin)
+                    if not is_admin and self.viz_tabs.currentWidget() is _w:
+                        self.viz_tabs.setCurrentIndex(0)
+
+        # Switcher widgets — sync the radio toggle to the active role.
+        # (programmatic setChecked does not emit buttonClicked, so no recursion)
+        if hasattr(self, "mode_group"):
+            (self.radio_admin if is_admin else self.radio_general).setChecked(True)
         if hasattr(self, "pin_change_btn"):
             self.pin_change_btn.setVisible(is_admin)
 
-    def _toggle_admin_mode(self):
-        """Enter admin mode via PIN, or drop back to general."""
-        if self.role == "admin":
+    def _on_mode_radio_clicked(self, button):
+        """General/Admin radio toggle. Selecting Admin requires the PIN; a
+        failed or cancelled auth reverts the selection to General."""
+        want_admin = button is self.radio_admin
+        if want_admin == (self.role == "admin"):
+            return  # already in the requested mode
+
+        if want_admin:
+            from .pin_dialog import prompt_admin_pin
+            if prompt_admin_pin(self):
+                self.role = "admin"
+                self._apply_role_visibility()
+                self.statusBar().showMessage("Admin 모드를 활성화했습니다.", 3000)
+                if app_config.is_default_pin():
+                    QMessageBox.information(
+                        self, "Admin",
+                        "기본 PIN(0000)이 사용 중입니다. 'PIN 변경'으로 변경을 권장합니다.")
+            else:
+                self.radio_general.setChecked(True)  # auth failed → revert
+        else:
             self.role = "general"
             self._apply_role_visibility()
-            self.statusBar().showMessage("일반 모드로 전환했습니다.", 3000)
-            return
-
-        from .pin_dialog import prompt_admin_pin
-        if prompt_admin_pin(self):
-            self.role = "admin"
-            self._apply_role_visibility()
-            self.statusBar().showMessage("Admin 모드를 활성화했습니다.", 3000)
-            if app_config.is_default_pin():
-                QMessageBox.information(
-                    self, "Admin",
-                    "기본 PIN(0000)이 사용 중입니다. 'PIN 변경'으로 변경을 권장합니다.")
+            self.statusBar().showMessage("General 모드로 전환했습니다.", 3000)
 
     def _change_admin_pin(self):
         """Change the admin PIN (admin only; re-verifies the current PIN first
@@ -632,31 +716,31 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
 
         title = QLabel("Spec 한계값 관리 (Admin)")
-        title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 13px;")
+        title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 16px;")
         layout.addWidget(title)
         info = QLabel(
             "표준 Spec은 고정값입니다. 여기서 프리셋(장비유형·outlier·range별 한계 override·메타)을 "
             "적용/관리합니다. '표준으로'를 누르면 override를 해제하고 내장 표준 spec으로 판정합니다.")
         info.setWordWrap(True)
-        info.setStyleSheet("color:#a6adc8; font-size:11px;")
+        info.setStyleSheet("color:#a6adc8; font-size:14px;")
         layout.addWidget(info)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("프리셋:"))
         self.preset_combo = QComboBox()
-        self.preset_combo.setMinimumWidth(220)
+        self.preset_combo.setMinimumWidth(275)
         self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
         row.addWidget(self.preset_combo, 1)
         self.preset_manage_btn = QPushButton("관리")
-        self.preset_manage_btn.setFixedWidth(64)
+        self.preset_manage_btn.setFixedWidth(80)
         self.preset_manage_btn.clicked.connect(self._manage_presets)
         row.addWidget(self.preset_manage_btn)
         self.preset_reset_btn = QPushButton("표준으로")
-        self.preset_reset_btn.setFixedWidth(80)
+        self.preset_reset_btn.setFixedWidth(100)
         self.preset_reset_btn.clicked.connect(self._reset_to_standard)
         row.addWidget(self.preset_reset_btn)
         spec_ref_btn = QPushButton("표준 Spec 표")
-        spec_ref_btn.setFixedWidth(104)
+        spec_ref_btn.setFixedWidth(130)
         spec_ref_btn.clicked.connect(self._show_spec_info_popup)
         row.addWidget(spec_ref_btn)
         layout.addLayout(row)
@@ -667,43 +751,74 @@ class MainWindow(QMainWindow):
 
     def _create_load_panel(self) -> QGroupBox:
         group = QGroupBox("Data Loading")
-        layout = QHBoxLayout(group)
+        layout = QVBoxLayout(group)
+        layout.setSpacing(6)
 
+        self._data_path_full = None
         self.path_label = QLabel("No data loaded")
-        self.path_label.setStyleSheet("color: #a6adc8; font-size: 12px;")
-        layout.addWidget(self.path_label, 1)
+        self.path_label.setStyleSheet("color: #a6adc8; font-size: 13px;")
+        layout.addWidget(self.path_label)
 
         self.load_btn = QPushButton("Open Folder")
         self.load_btn.setObjectName("load_btn")
-        self.load_btn.setFixedHeight(32)
+        self.load_btn.setFixedHeight(40)
         self.load_btn.clicked.connect(self._on_load_clicked)
         layout.addWidget(self.load_btn)
 
         # --- Access mode switcher (general / admin) ---
         mode_sep = QFrame()
-        mode_sep.setFrameShape(QFrame.VLine)
+        mode_sep.setFrameShape(QFrame.HLine)
         mode_sep.setStyleSheet("color: #45475a;")
         layout.addWidget(mode_sep)
 
-        self.mode_label = QLabel()
-        self.mode_label.setStyleSheet("font-size: 12px; font-weight: bold;")
-        layout.addWidget(self.mode_label)
+        # General / Admin as a compact radio toggle (same look as Spec Judgment).
+        # Selecting Admin prompts for the PIN; this saves the vertical space the
+        # old label + full-height button took, freeing room for Data Info below.
+        from PySide6.QtWidgets import QRadioButton, QButtonGroup
+        _mode_radio_style = (
+            "QRadioButton { font-size: 14px; font-weight: bold; color: #cdd6f4;"
+            " spacing: 6px; padding: 2px 2px; }"
+            "QRadioButton::indicator { width: 14px; height: 14px; }"
+            "QRadioButton::indicator:checked {"
+            " background-color: #89b4fa; border: 2px solid #b4befe; border-radius: 8px; }"
+            "QRadioButton::indicator:unchecked {"
+            " background-color: #313244; border: 2px solid #585b70; border-radius: 8px; }")
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(10)
+        self.mode_group = QButtonGroup(self)
+        self.radio_general = QRadioButton("General")
+        self.radio_admin = QRadioButton("Admin")
+        self.radio_general.setStyleSheet(_mode_radio_style)
+        self.radio_admin.setStyleSheet(_mode_radio_style)
+        self.radio_general.setChecked(True)  # Default: General
+        self.mode_group.addButton(self.radio_general)
+        self.mode_group.addButton(self.radio_admin)
+        self.mode_group.buttonClicked.connect(self._on_mode_radio_clicked)
+        mode_row.addWidget(self.radio_general)
+        mode_row.addWidget(self.radio_admin)
+        mode_row.addStretch()
 
         self.pin_change_btn = QPushButton("PIN 변경")
-        self.pin_change_btn.setFixedHeight(32)
+        self.pin_change_btn.setFixedHeight(26)
+        self.pin_change_btn.setStyleSheet(
+            "QPushButton { font-size: 12px; padding: 2px 10px; min-height: 0px; }")
         self.pin_change_btn.clicked.connect(self._change_admin_pin)
-        layout.addWidget(self.pin_change_btn)
-
-        self.admin_btn = QPushButton("Admin")
-        self.admin_btn.setFixedHeight(32)
-        self.admin_btn.clicked.connect(self._toggle_admin_mode)
-        layout.addWidget(self.admin_btn)
+        mode_row.addWidget(self.pin_change_btn)
+        layout.addLayout(mode_row)
 
         return group
 
+    def _set_data_path(self, text: str):
+        """Show the data path elided to the panel width; full path in the tooltip."""
+        self._data_path_full = text
+        self.path_label.setToolTip(text)
+        fm = QFontMetrics(self.path_label.font())
+        avail = max(self.path_label.width() - 4, 240)
+        self.path_label.setText(fm.elidedText(text, Qt.ElideMiddle, avail))
+
     def _create_settings_panel(self) -> QWidget:
         widget = QWidget()
-        widget.setMinimumWidth(240)
+        widget.setMinimumWidth(300)
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
@@ -722,11 +837,11 @@ class MainWindow(QMainWindow):
         range_layout = QVBoxLayout(range_group)
         self.range_combo = QComboBox()
         self.range_combo.setStyleSheet(
-            "QComboBox { font-size: 13px; font-weight: bold; padding: 6px; }")
+            "QComboBox { font-size: 16px; font-weight: bold; padding: 6px; }")
         self.range_combo.currentTextChanged.connect(self._on_range_changed)
         range_layout.addWidget(self.range_combo)
         self.range_info_label = QLabel("")
-        self.range_info_label.setStyleSheet("font-size: 10px; color: #a6adc8;")
+        self.range_info_label.setStyleSheet("font-size: 13px; color: #a6adc8;")
         range_layout.addWidget(self.range_info_label)
         layout.addWidget(range_group)
 
@@ -739,19 +854,19 @@ class MainWindow(QMainWindow):
         best5_inner.setContentsMargins(10, 6, 10, 8)
         best5_inner.setSpacing(6)
         best5_title = QLabel("Best-5 Window")
-        best5_title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 12px;")
+        best5_title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 15px;")
         best5_inner.addWidget(best5_title)
         best5_row = QHBoxLayout()
         best5_row.setSpacing(8)
         ws_label = QLabel("Window Size:")
-        ws_label.setStyleSheet("font-size: 12px;")
+        ws_label.setStyleSheet("font-size: 15px;")
         best5_row.addWidget(ws_label)
         self.window_spin = QSpinBox()
         self.window_spin.setRange(2, 20)
         self.window_spin.setValue(5)
-        self.window_spin.setFixedSize(80, 32)
+        self.window_spin.setFixedSize(100, 40)
         self.window_spin.setStyleSheet(
-            "QSpinBox { padding: 4px 6px; font-size: 14px; }"
+            "QSpinBox { padding: 4px 6px; font-size: 18px; }"
             "QSpinBox::up-button { width: 20px; }"
             "QSpinBox::down-button { width: 20px; }")
         self.window_spin.valueChanged.connect(self._on_reanalyze)
@@ -777,7 +892,7 @@ class MainWindow(QMainWindow):
 
         spec_title_row = QHBoxLayout()
         spec_title = QLabel("Spec Judgment")
-        spec_title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 12px;")
+        spec_title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 15px;")
         spec_title_row.addWidget(spec_title)
         spec_title_row.addStretch()
 
@@ -792,8 +907,8 @@ class MainWindow(QMainWindow):
         self.spec_help_btn = QPushButton()
         self.spec_help_btn.setIcon(self.style().standardIcon(
             QStyle.StandardPixmap.SP_MessageBoxInformation))
-        self.spec_help_btn.setIconSize(QSize(16, 16))
-        self.spec_help_btn.setFixedSize(22, 22)
+        self.spec_help_btn.setIconSize(QSize(20, 20))
+        self.spec_help_btn.setFixedSize(28, 28)
         self.spec_help_btn.setCursor(Qt.WhatsThisCursor)
         self.spec_help_btn.setStyleSheet(
             "QPushButton { background: transparent; border: none; }"
@@ -810,15 +925,17 @@ class MainWindow(QMainWindow):
         # Equipment type radio buttons
         from PySide6.QtWidgets import QRadioButton, QButtonGroup
         radio_style = (
-            "QRadioButton { font-size: 12px; font-weight: bold; color: #cdd6f4;"
+            "QRadioButton { font-size: 15px; font-weight: bold; color: #cdd6f4;"
             "spacing: 6px; padding: 2px 4px; }"
             "QRadioButton::indicator { width: 14px; height: 14px; }"
             "QRadioButton::indicator:checked { "
             "background-color: #89b4fa; border: 2px solid #b4befe; border-radius: 8px; }"
             "QRadioButton::indicator:unchecked { "
             "background-color: #313244; border: 2px solid #585b70; border-radius: 8px; }")
-        equip_row = QHBoxLayout()
-        equip_row.setSpacing(6)
+        # Stack the two equipment radios vertically so the full labels
+        # ("Isolated AE" / "Double Walled AE") never clip in the ~300px panel.
+        equip_col = QVBoxLayout()
+        equip_col.setSpacing(2)
         self.equip_group = QButtonGroup(self)
         self.radio_iso = QRadioButton("Isolated AE")
         self.radio_dw = QRadioButton("Double Walled AE")
@@ -828,16 +945,15 @@ class MainWindow(QMainWindow):
         self.equip_group.addButton(self.radio_iso)
         self.equip_group.addButton(self.radio_dw)
         self.radio_iso.toggled.connect(self._on_equipment_changed)
-        equip_row.addWidget(self.radio_iso)
-        equip_row.addWidget(self.radio_dw)
-        equip_row.addStretch()
-        spec_inner.addLayout(equip_row)
+        equip_col.addWidget(self.radio_iso)
+        equip_col.addWidget(self.radio_dw)
+        spec_inner.addLayout(equip_col)
 
         # Spec value lines (vertical, left-aligned)
         self.spec_lines_label = QLabel("\u2014")
         self.spec_lines_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.spec_lines_label.setStyleSheet(
-            "font-size: 12px; color: #cdd6f4; padding: 4px 2px;")
+            "font-size: 15px; color: #cdd6f4; padding: 4px 2px;")
         self.spec_lines_label.setWordWrap(True)
         spec_inner.addWidget(self.spec_lines_label)
 
@@ -850,7 +966,7 @@ class MainWindow(QMainWindow):
         self.spec_verdict_label = QLabel("\u2014")
         self.spec_verdict_label.setAlignment(Qt.AlignCenter)
         self.spec_verdict_label.setStyleSheet(
-            "font-size: 18px; font-weight: bold; padding: 4px;")
+            "font-size: 23px; font-weight: bold; padding: 4px;")
         spec_inner.addWidget(self.spec_verdict_label)
 
         layout.addWidget(spec_frame)
@@ -866,13 +982,13 @@ class MainWindow(QMainWindow):
 
         scan_title = QLabel("Scan Parameters")
         scan_title.setStyleSheet(
-            "font-size: 12px; font-weight: bold; color: #89b4fa; border: none;")
+            "font-size: 15px; font-weight: bold; color: #89b4fa; border: none;")
         scan_inner.addWidget(scan_title)
 
         self.scan_info_label = QLabel("—")
         self.scan_info_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.scan_info_label.setStyleSheet(
-            "font-size: 11px; color: #a6adc8; line-height: 1.4; border: none;")
+            "font-size: 14px; color: #a6adc8; line-height: 1.4; border: none;")
         self.scan_info_label.setWordWrap(True)
         scan_inner.addWidget(self.scan_info_label)
 
@@ -913,11 +1029,11 @@ class MainWindow(QMainWindow):
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         # Bigger font for readability
         table.setStyleSheet("""
-            QTableWidget { font-size: 13px; }
+            QTableWidget { font-size: 16px; }
             QTableWidget::item { padding: 6px; }
-            QHeaderView::section { font-size: 13px; padding: 8px; }
+            QHeaderView::section { font-size: 16px; padding: 8px; }
         """)
-        table.verticalHeader().setDefaultSectionSize(34)  # single-line "기본값 / 이상치 제외값"
+        table.verticalHeader().setDefaultSectionSize(43)  # single-line "기본값 / 이상치 제외값"
         # Metric columns render rich HTML so the right (이상치 제외값) number can be
         # colored independently; Range/Position keep the default plain rendering.
         self._summary_html_delegate = _HtmlDelegate(table)
@@ -940,6 +1056,7 @@ class MainWindow(QMainWindow):
         self.summary_show_robust.setToolTip(
             "반복 간 편차(Max−Min)가 큰 이상 픽셀을 제외한 값을 RAW 값 아래 함께 "
             "표시합니다. (기본: RAW만 표시)")
+        self.summary_show_robust.setStyleSheet("font-size:13px;")
         self.summary_show_robust.toggled.connect(self._on_reanalyze)
         ctrl.addWidget(self.summary_show_robust)
 
@@ -947,10 +1064,14 @@ class MainWindow(QMainWindow):
         oc = QHBoxLayout(self.outlier_ctrl_widget)
         oc.setContentsMargins(0, 0, 0, 0)
         oc.setSpacing(4)
-        oc.addWidget(QLabel("이상치 제외:"))
+        _excl_lbl = QLabel("이상치 제외:")
+        _excl_lbl.setStyleSheet("font-size:13px;")
+        oc.addWidget(_excl_lbl)
         self.outlier_mode_combo = QComboBox()
         self.outlier_mode_combo.addItems(["Percentile", "Pixels"])
-        self.outlier_mode_combo.setFixedSize(110, 30)
+        self.outlier_mode_combo.setFixedSize(130, 28)
+        self.outlier_mode_combo.setStyleSheet(
+            "QComboBox { font-size:13px; padding:1px 6px; min-height:0px; }")
         self.outlier_mode_combo.currentTextChanged.connect(self._on_outlier_mode_changed)
         oc.addWidget(self.outlier_mode_combo)
         self.outlier_value_spin = QDoubleSpinBox()
@@ -958,26 +1079,28 @@ class MainWindow(QMainWindow):
         self.outlier_value_spin.setValue(1.0)
         self.outlier_value_spin.setDecimals(1)
         self.outlier_value_spin.setSuffix(" %")
-        self.outlier_value_spin.setFixedSize(112, 30)
+        self.outlier_value_spin.setFixedSize(132, 28)
         self.outlier_value_spin.setStyleSheet(
-            "QDoubleSpinBox { padding: 2px 6px; font-size: 13px; }"
-            "QDoubleSpinBox::up-button { width: 20px; }"
-            "QDoubleSpinBox::down-button { width: 20px; }")
+            "QDoubleSpinBox { padding: 1px 6px; font-size: 13px; }"
+            "QDoubleSpinBox::up-button { width: 18px; }"
+            "QDoubleSpinBox::down-button { width: 18px; }")
         self.outlier_value_spin.valueChanged.connect(self._on_reanalyze)
         oc.addWidget(self.outlier_value_spin)
         ctrl.addWidget(self.outlier_ctrl_widget)
 
-        # ⓘ — educational illustration (available to everyone)
+        # ⓘ — basic outlier illustration (everyone); full diagnostic only in admin.
         self.outlier_help_btn = QPushButton()
         self.outlier_help_btn.setIcon(self.style().standardIcon(
             QStyle.StandardPixmap.SP_MessageBoxInformation))
-        self.outlier_help_btn.setIconSize(QSize(16, 16))
-        self.outlier_help_btn.setFixedSize(24, 24)
+        self.outlier_help_btn.setIconSize(QSize(18, 18))
+        self.outlier_help_btn.setFixedSize(26, 26)
         self.outlier_help_btn.setCursor(Qt.WhatsThisCursor)
+        # Tooltip is set per-role in _apply_role_visibility(); default = general.
         self.outlier_help_btn.setToolTip("이상치(제외 픽셀)가 무엇인지 현재 데이터로 보기")
         self.outlier_help_btn.setStyleSheet(
-            "QPushButton { background: transparent; border: none; }"
-            "QPushButton:hover { background: #181825; border-radius: 12px; }")
+            "QPushButton { background: transparent; border: none; padding: 0px;"
+            " min-width: 0px; min-height: 0px; }"
+            "QPushButton:hover { background: #181825; border-radius: 13px; }")
         self.outlier_help_btn.clicked.connect(self._show_outlier_info_popup)
         ctrl.addWidget(self.outlier_help_btn)
         ctrl.addStretch()
@@ -986,31 +1109,30 @@ class MainWindow(QMainWindow):
         legend = QLabel(
             "각 칸 = <b>기본값 / 이상치 제외값</b>(이상 픽셀 제외). 우측 색은 <b>Rep.1σ·OPM Max</b>만 — "
             "<span style='color:#a6e3a1'>초록=Spec 한계 이내</span> · <span style='color:#f38ba8'>빨강=초과</span> "
-            "(Rep.Max·OPM 1σ는 한계 없어 중립). <b>공식 합격/불합격은 Spec 패널의 집계 기준</b>. "
+            "(Rep.Max·OPM 1σ는 한계 없어 중립).<br>"
+            "<b>공식 합격/불합격은 Spec 패널의 집계 기준</b>.<br>"
             "이상치 = 반복 간 편차(Max−Min)가 큰 픽셀 (ⓘ로 확인 · 임계값 조정은 Admin).")
         legend.setWordWrap(True)
-        legend.setStyleSheet("color:#a6adc8; font-size:11px; padding:3px 6px;")
+        legend.setStyleSheet("color:#a6adc8; font-size:12px; padding:2px 6px;")
         v.addWidget(legend)
         v.addWidget(table)
         return container
 
-    def _show_outlier_info_popup(self):
-        """Educational popup: show which pixels the outlier exclusion drops, using
-        the currently-loaded data (or a synthetic example when nothing is loaded)."""
-        from PySide6.QtWidgets import QDialog
+    def _show_outlier_basic_popup(self):
+        """General mode: a basic educational popup — what an outlier pixel is, with a
+        per-position illustration. The user can pick a measurement position to see
+        which pixels would be excluded at the current setting. No diagnosis (that is
+        admin-only, to avoid confusing manufacturing engineers when the spec is IN)."""
+        from PySide6.QtWidgets import QDialog, QComboBox
         from ..visualization.plot_manager import create_outlier_illustration_figure
+        from ..core.data_loader import POSITION_LABELS
 
         mode = self.outlier_mode_combo.currentText().lower()
         value = self.outlier_value_spin.value()
-        try:
-            fig = create_outlier_illustration_figure(self.current_recipe, mode, value)
-        except Exception as e:  # never let the help popup crash the app
-            QMessageBox.warning(self, "이상치 설명", f"도식 생성 실패: {e}")
-            return
 
         dlg = QDialog(self)
         dlg.setWindowTitle("이상치(제외 픽셀) 설명")
-        dlg.setMinimumSize(780, 640)
+        dlg.setMinimumSize(975, 760)
         dlg.setStyleSheet(
             "QDialog { background-color: #1e1e2e; } QLabel { color: #cdd6f4; }"
             "QPushButton { background:#45475a; color:#cdd6f4; padding:6px 18px;"
@@ -1019,17 +1141,271 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(14, 14, 14, 14)
         intro = QLabel(
             "<b>이상치(outlier) 픽셀</b> = 같은 위치를 반복 측정했을 때 <b>픽셀별 편차(Max−Min)가 "
-            "유난히 큰 지점</b>입니다(스크래치·파티클·순간 노이즈 등). 이 픽셀을 제외하고 다시 "
-            "계산한 값이 <b>'이상치 제외값'</b>입니다. 아래 <span style='color:#f38ba8'>빨강</span> = "
-            "현재 설정에서 제외될 픽셀.")
+            "유난히 큰 지점</b>입니다(스크래치·파티클·순간 노이즈 등).<br>"
+            "이 픽셀을 제외하고 다시 계산한 값이 <b>'이상치 제외값'</b>입니다.<br>"
+            "아래 <span style='color:#f38ba8'>빨강</span> = 현재 설정에서 제외될 픽셀.")
         intro.setWordWrap(True)
-        intro.setStyleSheet("font-size:12px; padding:2px 2px 6px;")
+        intro.setStyleSheet("font-size:15px; padding:2px 2px 6px;")
         lay.addWidget(intro)
-        lay.addWidget(FigureCanvas(fig), 1)
+
+        # Position selector — see which pixels are excluded at each position.
+        pos_row = QHBoxLayout()
+        pos_row.addWidget(QLabel("Position:"))
+        pos_combo = QComboBox()
+        pos_combo.addItem("Auto (최대 편차)")
+        pos_combo.addItems(POSITION_LABELS)
+        pos_combo.setFixedWidth(150)
+        pos_row.addWidget(pos_combo)
+        pos_row.addStretch()
+        lay.addLayout(pos_row)
+
+        holder = QVBoxLayout()
+        lay.addLayout(holder, 1)
+        state = {"canvas": None}
+
+        def render():
+            pos = None if pos_combo.currentIndex() == 0 else pos_combo.currentText()
+            try:
+                fig = create_outlier_illustration_figure(
+                    self.current_recipe, mode, value, position=pos, show_mm=True)
+            except Exception as e:
+                QMessageBox.warning(dlg, "이상치 설명", f"도식 생성 실패: {e}")
+                return
+            old = state.get("canvas")
+            if old is not None:
+                holder.removeWidget(old)
+                old.setParent(None)
+                try:
+                    old.figure.clear()
+                except Exception:
+                    pass
+                old.deleteLater()
+            cv = FigureCanvas(fig)
+            state["canvas"] = cv
+            holder.addWidget(cv)
+
+        pos_combo.currentIndexChanged.connect(render)
+        render()
+
         close = QPushButton("닫기")
         close.clicked.connect(dlg.close)
         lay.addWidget(close, alignment=Qt.AlignRight)
         dlg.exec()
+
+    def _show_outlier_info_popup(self):
+        """Outlier diagnostic. General mode shows only the basic educational popup;
+        the full per-position DIAGNOSTIC (3 tabs) is ADMIN-only, since manufacturing
+        engineers find the deep analysis confusing when the spec is already IN.
+
+        Admin tabs: 포지션 진단 (position → illustration + signal readout + 감별 가이드),
+        공간 패턴 (3×3 outlier severity wafer map), 주기성/구조 (spectrum + ball-screw
+        lead). Synthetic fallback when no data; the Spec judgment is never affected."""
+        if self.role != "admin":
+            return self._show_outlier_basic_popup()
+        from PySide6.QtWidgets import QDialog, QTabWidget, QComboBox, QDoubleSpinBox
+        from ..visualization.plot_manager import (
+            create_outlier_illustration_figure, create_outlier_wafer_map_figure,
+            create_periodicity_figure)
+        from ..core.diagnostics import diagnose_position, worst_position
+        from ..core.data_loader import POSITION_LABELS
+
+        mode = self.outlier_mode_combo.currentText().lower()
+        value = self.outlier_value_spin.value()
+        unit = "%" if mode == "percentile" else "px"
+        recipe = self.current_recipe
+        has_data = recipe is not None and getattr(recipe, "repeats", None)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("이상치 진단 — 포지션별 근본원인 감별")
+        dlg.setMinimumSize(1040, 860)
+        dlg.setStyleSheet(
+            "QDialog { background-color: #1e1e2e; } QLabel { color: #cdd6f4; }"
+            "QPushButton { background:#45475a; color:#cdd6f4; padding:6px 18px;"
+            " border-radius:4px; } QPushButton:hover { background:#585b70; }")
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+        intro = QLabel(
+            "<b>이상치(outlier) 픽셀</b> = 반복 측정 시 픽셀별 편차(Max−Min)가 큰 지점. "
+            "포지션을 선택해 <b>어디서·몇 번 반복</b>에서 났는지 보고, 신호로 "
+            "<b>일시적(파티클·글리치·진동)</b> vs <b>구조적(척 평탄도·볼스크류)</b>을 감별합니다. "
+            "<span style='color:#6c7086'>공식 합격/불합격은 Spec 패널 집계 기준 · 본 진단은 참고용.</span>")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("font-size:13px; padding:2px 2px 4px;")
+        root.addWidget(intro)
+
+        tabs = QTabWidget()
+        root.addWidget(tabs, 1)
+
+        def _swap(holder, st, fig):
+            old = st.get("canvas")
+            if old is not None:
+                holder.removeWidget(old)
+                old.setParent(None)
+                try:
+                    old.figure.clear()
+                except Exception:
+                    pass
+                old.deleteLater()
+            cv = FigureCanvas(fig)
+            st["canvas"] = cv
+            holder.addWidget(cv)
+
+        # ---- Tab 1: 포지션 진단 ----
+        t1 = QWidget()
+        t1l = QVBoxLayout(t1)
+        t1l.setContentsMargins(6, 6, 6, 6)
+        t1l.setSpacing(6)
+        c1 = QHBoxLayout()
+        c1.addWidget(QLabel("Position:"))
+        pos_combo = QComboBox()
+        pos_combo.addItem("Auto (최대 편차)")
+        pos_combo.addItems(POSITION_LABELS)
+        pos_combo.setFixedWidth(150)
+        c1.addWidget(pos_combo)
+        c1.addWidget(QLabel(
+            f"   이상치 제외: {self.outlier_mode_combo.currentText()} {value:g}{unit}"))
+        c1.addStretch()
+        t1l.addLayout(c1)
+        body = QHBoxLayout()
+        fig_holder = QVBoxLayout()
+        body.addLayout(fig_holder, 3)
+        readout = QLabel()
+        readout.setWordWrap(True)
+        readout.setAlignment(Qt.AlignTop)
+        readout.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        readout.setStyleSheet("color:#cdd6f4; padding:4px 8px;")
+        ro_scroll = QScrollArea()
+        ro_scroll.setWidgetResizable(True)
+        ro_scroll.setWidget(readout)
+        ro_scroll.setFixedWidth(370)
+        ro_scroll.setFrameShape(QFrame.NoFrame)
+        body.addWidget(ro_scroll)
+        t1l.addLayout(body, 1)
+        tabs.addTab(t1, "포지션 진단")
+        st1 = {"canvas": None}
+
+        def render_tab1():
+            pos = None if pos_combo.currentIndex() == 0 else pos_combo.currentText()
+            rp = pos
+            if pos is None and has_data:
+                rp = worst_position(recipe)        # match the figure's auto-pick
+            try:
+                fig = create_outlier_illustration_figure(
+                    recipe, mode, value, position=rp, show_mm=True)
+            except Exception as e:
+                QMessageBox.warning(dlg, "이상치 진단", f"도식 생성 실패: {e}")
+                return
+            _swap(fig_holder, st1, fig)
+            if rp and has_data:
+                try:
+                    d = diagnose_position(recipe, rp, mode, value)
+                    readout.setText(self._diagnosis_html(d))
+                except Exception as e:
+                    readout.setText(f"<span style='color:#f38ba8'>진단 실패: {e}</span>")
+            else:
+                readout.setText("<i>데이터가 없어 예시 도식만 표시합니다. "
+                                "폴더를 불러오면 포지션별 진단이 활성화됩니다.</i>")
+
+        pos_combo.currentIndexChanged.connect(render_tab1)
+
+        # ---- Tab 2: 공간 패턴 (outlier wafer map) ----
+        t2 = QWidget()
+        t2l = QVBoxLayout(t2)
+        t2l.setContentsMargins(6, 6, 6, 6)
+        if has_data:
+            try:
+                t2l.addWidget(FigureCanvas(
+                    create_outlier_wafer_map_figure(recipe, mode, value)))
+            except Exception as e:
+                t2l.addWidget(QLabel(f"웨이퍼맵 생성 실패: {e}"))
+        else:
+            t2l.addWidget(QLabel("데이터가 없습니다 — 폴더를 불러오세요."))
+        tabs.addTab(t2, "공간 패턴")
+
+        # ---- Tab 3: 주기성 / 구조 ----
+        t3 = QWidget()
+        t3l = QVBoxLayout(t3)
+        t3l.setContentsMargins(6, 6, 6, 6)
+        t3l.setSpacing(6)
+        c3 = QHBoxLayout()
+        c3.addWidget(QLabel("Position:"))
+        pos_combo3 = QComboBox()
+        pos_combo3.addItems(POSITION_LABELS)
+        pos_combo3.setFixedWidth(120)
+        c3.addWidget(pos_combo3)
+        c3.addWidget(QLabel("   볼스크류 리드(mm):"))
+        lead_spin = QDoubleSpinBox()
+        lead_spin.setRange(0.0, 50.0)
+        lead_spin.setDecimals(3)
+        lead_spin.setSingleStep(0.5)
+        lead_spin.setValue(0.0)
+        lead_spin.setSpecialValueText("미사용")     # 0 → not used
+        lead_spin.setFixedWidth(110)
+        c3.addWidget(lead_spin)
+        c3.addWidget(QLabel("(지배 공간주기와 비교 — 일치 시 볼스크류 의심)"))
+        c3.addStretch()
+        t3l.addLayout(c3)
+        fig3_holder = QVBoxLayout()
+        t3l.addLayout(fig3_holder, 1)
+        tabs.addTab(t3, "주기성 / 구조")
+        st3 = {"canvas": None}
+
+        def render_tab3():
+            pos = pos_combo3.currentText()
+            lead = lead_spin.value() or None
+            try:
+                fig = create_periodicity_figure(recipe, pos, lead_mm=lead)
+            except Exception as e:
+                QMessageBox.warning(dlg, "주기성", f"스펙트럼 생성 실패: {e}")
+                return
+            _swap(fig3_holder, st3, fig)
+
+        pos_combo3.currentIndexChanged.connect(render_tab3)
+        lead_spin.valueChanged.connect(render_tab3)
+
+        render_tab1()
+        render_tab3()
+
+        close = QPushButton("닫기")
+        close.clicked.connect(dlg.close)
+        root.addWidget(close, alignment=Qt.AlignRight)
+        dlg.exec()
+
+    def _diagnosis_html(self, d) -> str:
+        """Format a PositionDiagnosis as the right-pane readout (signals + guide)."""
+        cc = {"높음": "#89b4fa", "중간": "#f9e2af", "낮음": "#a6adc8"}
+        parts = [f"<div style='font-size:14px'><b>{d.position}</b> · {d.group} · "
+                 f"반복 {d.n_repeats}</div>"]
+        if d.note:
+            parts.append(f"<div style='color:#f9e2af'>{d.note}</div>")
+        sig = [
+            f"제외 픽셀 {d.n_excluded}개 · 스파이크 폭 {d.spike_width_px}px"
+            f"(≈{d.spike_width_mm:.3f}mm)",
+            f"관여 반복 {d.n_repeats_involved}/{d.n_repeats} (최대 편차 R{d.worst_repeat})",
+            f"Rep.Max {d.rep_max_before:.1f} → 제외후 {d.rep_max_after:.1f} nm",
+            f"Rep.1σ {d.rep_1sigma:.2f}"
+            + (f" / Spec {d.spec_rep_1sigma:.1f}" if d.spec_rep_1sigma else "")
+            + f" nm · OPM Max {d.opm_max:.1f} nm",
+            f"반복간 OPM 추세: {d.drift_dir} "
+            f"(기울기 {d.drift_slope:+.2f} nm/회, R²={d.drift_r2:.2f})",
+            f"코어스 형상 잔존비 {d.bow_persist_ratio:.2f} (1=구조적·0=일시적)",
+            f"지배 공간주기 {d.dominant_period_mm:.3f} mm",
+        ]
+        parts.append("<div style='font-size:12px;color:#bac2de;margin-top:4px'>"
+                     + "<br>".join("· " + s for s in sig) + "</div>")
+        parts.append("<div style='font-size:13px;margin-top:8px'>"
+                     "<b>추정 원인 (참고용 감별 가이드)</b></div>")
+        for i, g in enumerate(d.guides):
+            col = cc.get(g.confidence, "#cdd6f4")
+            mark = "▶ " if i == 0 else "· "
+            parts.append(
+                f"<div style='font-size:12px;margin-top:3px'>{mark}<b>{g.cause}</b> "
+                f"<span style='color:{col}'>[{g.confidence}]</span><br>"
+                f"<span style='color:#a6adc8'>&nbsp;&nbsp;{g.evidence}</span></div>")
+        parts.append(f"<div style='font-size:11px;color:#6c7086;margin-top:8px'>"
+                     f"{d.disclaimer}</div>")
+        return "".join(parts)
 
     def _create_flatten_tab(self) -> QWidget:
         """Flatten tab — single row controls for maximum chart space."""
@@ -1046,19 +1422,19 @@ class MainWindow(QMainWindow):
         ctrl_row.addWidget(QLabel("Pos:"))
         self.flat_pos_combo = QComboBox()
         self.flat_pos_combo.addItems(POSITION_LABELS)
-        self.flat_pos_combo.setFixedWidth(70)
+        self.flat_pos_combo.setFixedWidth(88)
         ctrl_row.addWidget(self.flat_pos_combo)
 
         ctrl_row.addWidget(QLabel("Rep:"))
         self.flat_rep_combo = QComboBox()
-        self.flat_rep_combo.setFixedWidth(90)
+        self.flat_rep_combo.setFixedWidth(113)
         ctrl_row.addWidget(self.flat_rep_combo)
 
         ctrl_row.addWidget(QLabel("Ord:"))
         self.flat_order_combo = QComboBox()
         self.flat_order_combo.addItems([str(i) for i in range(13)])
         self.flat_order_combo.setCurrentIndex(1)
-        self.flat_order_combo.setFixedWidth(50)
+        self.flat_order_combo.setFixedWidth(63)
         ctrl_row.addWidget(self.flat_order_combo)
 
         ctrl_row.addWidget(QLabel("Edge%:"))
@@ -1066,9 +1442,9 @@ class MainWindow(QMainWindow):
         self.flat_edge_spin.setRange(0, 10)
         self.flat_edge_spin.setValue(1.0)
         self.flat_edge_spin.setSingleStep(0.5)
-        self.flat_edge_spin.setFixedSize(75, 30)
+        self.flat_edge_spin.setFixedSize(94, 38)
         self.flat_edge_spin.setStyleSheet(
-            "QDoubleSpinBox { padding: 3px 4px; font-size: 12px; }"
+            "QDoubleSpinBox { padding: 3px 4px; font-size: 15px; }"
             "QDoubleSpinBox::up-button { width: 18px; }"
             "QDoubleSpinBox::down-button { width: 18px; }")
         ctrl_row.addWidget(self.flat_edge_spin)
@@ -1091,8 +1467,8 @@ class MainWindow(QMainWindow):
 
         # Stats (minimal height)
         self.flat_stats_label = QLabel("")
-        self.flat_stats_label.setStyleSheet("font-size: 11px; color: #a6adc8; padding: 2px 4px;")
-        self.flat_stats_label.setFixedHeight(20)
+        self.flat_stats_label.setStyleSheet("font-size: 14px; color: #a6adc8; padding: 2px 4px;")
+        self.flat_stats_label.setFixedHeight(25)
         layout.addWidget(self.flat_stats_label)
 
         # Canvas
@@ -1116,22 +1492,22 @@ class MainWindow(QMainWindow):
         summary_layout.setVerticalSpacing(6)
 
         self.time_total_label = QLabel("—")
-        self.time_total_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #89b4fa;")
+        self.time_total_label.setStyleSheet("font-size: 23px; font-weight: bold; color: #89b4fa;")
         summary_layout.addWidget(QLabel("Total Duration:"), 0, 0)
         summary_layout.addWidget(self.time_total_label, 0, 1)
 
         self.time_avg_repeat_label = QLabel("—")
-        self.time_avg_repeat_label.setStyleSheet("font-size: 14px; color: #cdd6f4;")
+        self.time_avg_repeat_label.setStyleSheet("font-size: 18px; color: #cdd6f4;")
         summary_layout.addWidget(QLabel("Avg per Repeat:"), 1, 0)
         summary_layout.addWidget(self.time_avg_repeat_label, 1, 1)
 
         self.time_avg_point_label = QLabel("—")
-        self.time_avg_point_label.setStyleSheet("font-size: 14px; color: #cdd6f4;")
+        self.time_avg_point_label.setStyleSheet("font-size: 18px; color: #cdd6f4;")
         summary_layout.addWidget(QLabel("Avg per Point:"), 2, 0)
         summary_layout.addWidget(self.time_avg_point_label, 2, 1)
 
         self.time_continuous_label = QLabel("—")
-        self.time_continuous_label.setStyleSheet("font-size: 14px;")
+        self.time_continuous_label.setStyleSheet("font-size: 18px;")
         summary_layout.addWidget(QLabel("Continuity:"), 3, 0)
         summary_layout.addWidget(self.time_continuous_label, 3, 1)
 
@@ -1145,12 +1521,12 @@ class MainWindow(QMainWindow):
         self.time_est_spin = QSpinBox()
         self.time_est_spin.setRange(1, 100)
         self.time_est_spin.setValue(10)
-        self.time_est_spin.setFixedWidth(80)
+        self.time_est_spin.setFixedWidth(100)
         self.time_est_spin.valueChanged.connect(self._update_time_estimate)
         est_row.addWidget(QLabel("Repeat Count:"))
         est_row.addWidget(self.time_est_spin)
         self.time_est_result = QLabel("—")
-        self.time_est_result.setStyleSheet("font-size: 16px; font-weight: bold; color: #f9e2af;")
+        self.time_est_result.setStyleSheet("font-size: 20px; font-weight: bold; color: #f9e2af;")
         est_row.addWidget(QLabel("→"))
         est_row.addWidget(self.time_est_result)
         est_row.addStretch()
@@ -1169,11 +1545,11 @@ class MainWindow(QMainWindow):
         ])
         self.time_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.time_table.setStyleSheet("""
-            QTableWidget { font-size: 13px; }
+            QTableWidget { font-size: 16px; }
             QTableWidget::item { padding: 6px; }
-            QHeaderView::section { font-size: 13px; padding: 8px; }
+            QHeaderView::section { font-size: 16px; padding: 8px; }
         """)
-        self.time_table.verticalHeader().setDefaultSectionSize(30)
+        self.time_table.verticalHeader().setDefaultSectionSize(38)
         layout.addWidget(self.time_table)
 
         return widget
@@ -1192,7 +1568,7 @@ class MainWindow(QMainWindow):
         ctrl_row.addWidget(QLabel("Material:"))
         self.bs_material_combo = QComboBox()
         self.bs_material_combo.addItems(["AL (≤6.0 nm)", "SUS (≤4.5 nm)"])
-        self.bs_material_combo.setFixedWidth(130)
+        self.bs_material_combo.setFixedWidth(163)
         ctrl_row.addWidget(self.bs_material_combo)
 
         from PySide6.QtWidgets import QCheckBox
@@ -1210,9 +1586,9 @@ class MainWindow(QMainWindow):
         # Verdict badge
         self.bs_verdict_label = QLabel("—")
         self.bs_verdict_label.setAlignment(Qt.AlignCenter)
-        self.bs_verdict_label.setFixedWidth(80)
+        self.bs_verdict_label.setFixedWidth(100)
         self.bs_verdict_label.setStyleSheet(
-            "font-size: 16px; font-weight: bold; border: 2px solid #45475a;"
+            "font-size: 20px; font-weight: bold; border: 2px solid #45475a;"
             "border-radius: 6px; padding: 4px; color: #a6adc8;")
         ctrl_row.addWidget(self.bs_verdict_label)
         ctrl_row.addStretch()
@@ -1228,16 +1604,16 @@ class MainWindow(QMainWindow):
 
         # ── Summary table ────────────────────────────────────────────────────
         self.bs_table = QTableWidget()
-        self.bs_table.setMinimumHeight(180)
-        self.bs_table.setMaximumHeight(220)
+        self.bs_table.setMinimumHeight(225)
+        self.bs_table.setMaximumHeight(275)
         self.bs_table.setStyleSheet("""
-            QTableWidget { font-size: 12px; }
+            QTableWidget { font-size: 15px; }
             QTableWidget::item { padding: 4px; }
-            QHeaderView::section { font-size: 12px; padding: 6px;
+            QHeaderView::section { font-size: 15px; padding: 6px;
                 background-color: #313244; color: #89b4fa;
                 border: 1px solid #45475a; font-weight: bold; }
         """)
-        self.bs_table.verticalHeader().setDefaultSectionSize(26)
+        self.bs_table.verticalHeader().setDefaultSectionSize(33)
         layout.addWidget(self.bs_table)
 
         return widget
@@ -1273,14 +1649,14 @@ class MainWindow(QMainWindow):
 
         self.qc_verdict_label = QLabel("-")
         self.qc_verdict_label.setAlignment(Qt.AlignCenter)
-        self.qc_verdict_label.setFixedWidth(80)
+        self.qc_verdict_label.setFixedWidth(100)
         self.qc_verdict_label.setStyleSheet(
-            "font-size: 16px; font-weight: bold; border: 2px solid #45475a;"
+            "font-size: 20px; font-weight: bold; border: 2px solid #45475a;"
             "border-radius: 6px; padding: 4px; color: #a6adc8;")
         ctrl_row.addWidget(self.qc_verdict_label)
 
         self.qc_timestamp_label = QLabel("")
-        self.qc_timestamp_label.setStyleSheet("font-size: 11px; color: #6c7086;")
+        self.qc_timestamp_label.setStyleSheet("font-size: 14px; color: #6c7086;")
         ctrl_row.addWidget(self.qc_timestamp_label)
 
         ctrl_row.addStretch()
@@ -1300,16 +1676,16 @@ class MainWindow(QMainWindow):
         self.qc_summary_labels: list[tuple[QLabel, QLabel, QLabel]] = []
         for i, (check_id, check_name) in enumerate(self._QC_CHECK_NAMES):
             status_lbl = QLabel("-")
-            status_lbl.setFixedWidth(36)
+            status_lbl.setFixedWidth(45)
             status_lbl.setAlignment(Qt.AlignCenter)
             status_lbl.setStyleSheet(
-                "font-size: 12px; font-weight: bold; color: #6c7086;")
+                "font-size: 15px; font-weight: bold; color: #6c7086;")
 
             name_lbl = QLabel(f"{check_id}: {check_name}")
-            name_lbl.setStyleSheet("font-size: 12px; color: #cdd6f4;")
+            name_lbl.setStyleSheet("font-size: 15px; color: #cdd6f4;")
 
             summary_lbl = QLabel("")
-            summary_lbl.setStyleSheet("font-size: 11px; color: #a6adc8;")
+            summary_lbl.setStyleSheet("font-size: 14px; color: #a6adc8;")
 
             summary_grid.addWidget(status_lbl, i, 0)
             summary_grid.addWidget(name_lbl, i, 1)
@@ -1325,7 +1701,7 @@ class MainWindow(QMainWindow):
         self.qc_detail_combo = QComboBox()
         for check_id, check_name in self._QC_CHECK_NAMES:
             self.qc_detail_combo.addItem(f"{check_id}: {check_name}")
-        self.qc_detail_combo.setFixedWidth(280)
+        self.qc_detail_combo.setFixedWidth(350)
         self.qc_detail_combo.currentIndexChanged.connect(self._on_qc_detail_changed)
         detail_row.addWidget(self.qc_detail_combo)
         detail_row.addStretch()
@@ -1334,13 +1710,13 @@ class MainWindow(QMainWindow):
         self.qc_detail_table = QTableWidget()
         self.qc_detail_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.qc_detail_table.setStyleSheet("""
-            QTableWidget { font-size: 12px; }
+            QTableWidget { font-size: 15px; }
             QTableWidget::item { padding: 4px; }
-            QHeaderView::section { font-size: 12px; padding: 6px;
+            QHeaderView::section { font-size: 15px; padding: 6px;
                 background-color: #313244; color: #89b4fa;
                 border: 1px solid #45475a; font-weight: bold; }
         """)
-        self.qc_detail_table.verticalHeader().setDefaultSectionSize(26)
+        self.qc_detail_table.verticalHeader().setDefaultSectionSize(33)
         self.qc_detail_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.qc_detail_table)
 
@@ -1373,7 +1749,7 @@ class MainWindow(QMainWindow):
         color = self._QC_COLORS.get(qc.overall_status, "#a6adc8")
         self.qc_verdict_label.setText(qc.overall_status)
         self.qc_verdict_label.setStyleSheet(
-            f"font-size: 16px; font-weight: bold; border: 2px solid {color};"
+            f"font-size: 20px; font-weight: bold; border: 2px solid {color};"
             f"border-radius: 6px; padding: 4px; color: {color};")
         self.qc_timestamp_label.setText(qc.timestamp)
 
@@ -1385,7 +1761,7 @@ class MainWindow(QMainWindow):
             c = self._QC_COLORS.get(check.status, "#a6adc8")
             status_lbl.setText(check.status)
             status_lbl.setStyleSheet(
-                f"font-size: 12px; font-weight: bold; color: {c};"
+                f"font-size: 15px; font-weight: bold; color: {c};"
                 f"border: 1px solid {c}; border-radius: 3px;")
             summary_lbl.setText(check.summary)
 
@@ -1396,14 +1772,14 @@ class MainWindow(QMainWindow):
         """Reset QC tab to initial state."""
         self.qc_verdict_label.setText("-")
         self.qc_verdict_label.setStyleSheet(
-            "font-size: 16px; font-weight: bold; border: 2px solid #45475a;"
+            "font-size: 20px; font-weight: bold; border: 2px solid #45475a;"
             "border-radius: 6px; padding: 4px; color: #a6adc8;")
         self.qc_timestamp_label.setText("")
 
         for status_lbl, name_lbl, summary_lbl in self.qc_summary_labels:
             status_lbl.setText("-")
             status_lbl.setStyleSheet(
-                "font-size: 12px; font-weight: bold; color: #6c7086;")
+                "font-size: 15px; font-weight: bold; color: #6c7086;")
             summary_lbl.setText("")
 
         self.qc_detail_table.clear()
@@ -1520,7 +1896,7 @@ class MainWindow(QMainWindow):
         ctrl_row.addWidget(self.compare_load_btn)
 
         self.compare_info_label = QLabel("No reference loaded")
-        self.compare_info_label.setStyleSheet("font-size: 12px; color: #a6adc8;")
+        self.compare_info_label.setStyleSheet("font-size: 15px; color: #a6adc8;")
         ctrl_row.addWidget(self.compare_info_label)
 
         ctrl_row.addStretch()
@@ -1529,13 +1905,13 @@ class MainWindow(QMainWindow):
         # Compare table
         self.compare_table = QTableWidget()
         self.compare_table.setStyleSheet("""
-            QTableWidget { font-size: 12px; }
+            QTableWidget { font-size: 15px; }
             QTableWidget::item { padding: 4px; }
-            QHeaderView::section { font-size: 12px; padding: 6px;
+            QHeaderView::section { font-size: 15px; padding: 6px;
                 background-color: #313244; color: #89b4fa;
                 border: 1px solid #45475a; font-weight: bold; }
         """)
-        self.compare_table.verticalHeader().setDefaultSectionSize(26)
+        self.compare_table.verticalHeader().setDefaultSectionSize(33)
         self.compare_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.compare_table)
 
@@ -1624,7 +2000,7 @@ class MainWindow(QMainWindow):
                 if row.get("Position", "").startswith("["):
                     item.setBackground(QColor("#1e1e2e"))
                     item.setForeground(QColor("#f9e2af"))
-                    item.setFont(QFont("Segoe UI", 11, QFont.Bold))
+                    item.setFont(QFont("Segoe UI", 14, QFont.Bold))
 
                 self.compare_table.setItem(i, j, item)
 
@@ -1655,22 +2031,22 @@ class MainWindow(QMainWindow):
 
         export_title = QLabel("Export Analysis Results")
         export_title.setStyleSheet(
-            "font-size: 16px; font-weight: bold; color: #89b4fa;")
+            "font-size: 20px; font-weight: bold; color: #89b4fa;")
         export_layout.addWidget(export_title)
 
         export_desc = QLabel(
             "Export summary CSV, average line profiles, spec checklist,\n"
             "and all chart images (PNG) to a selected folder.")
-        export_desc.setStyleSheet("font-size: 12px; color: #a6adc8;")
+        export_desc.setStyleSheet("font-size: 15px; color: #a6adc8;")
         export_desc.setWordWrap(True)
         export_layout.addWidget(export_desc)
 
         self.export_btn = QPushButton("Export Results")
         self.export_btn.setObjectName("export_btn")
-        self.export_btn.setFixedHeight(40)
+        self.export_btn.setFixedHeight(50)
         self.export_btn.setStyleSheet(
             "QPushButton { background-color: #1e66f5; color: white;"
-            "font-weight: bold; font-size: 14px; border-radius: 6px; }"
+            "font-weight: bold; font-size: 18px; border-radius: 6px; }"
             "QPushButton:hover { background-color: #2e7fff; }"
             "QPushButton:disabled { background-color: #45475a; color: #6c7086; }")
         self.export_btn.clicked.connect(self._on_export)
@@ -1678,10 +2054,10 @@ class MainWindow(QMainWindow):
         export_layout.addWidget(self.export_btn)
 
         self.pdf_report_btn = QPushButton("검수 리포트 (PDF)")
-        self.pdf_report_btn.setFixedHeight(40)
+        self.pdf_report_btn.setFixedHeight(50)
         self.pdf_report_btn.setStyleSheet(
             "QPushButton { background-color: #40a02b; color: white;"
-            "font-weight: bold; font-size: 14px; border-radius: 6px; }"
+            "font-weight: bold; font-size: 18px; border-radius: 6px; }"
             "QPushButton:hover { background-color: #50c03b; }"
             "QPushButton:disabled { background-color: #45475a; color: #6c7086; }")
         self.pdf_report_btn.clicked.connect(self._on_pdf_report)
@@ -1703,7 +2079,7 @@ class MainWindow(QMainWindow):
             QListWidget {
                 background-color: #181825; color: #cdd6f4;
                 border: 1px solid #45475a; border-radius: 6px;
-                font-size: 13px; padding: 4px;
+                font-size: 16px; padding: 4px;
             }
             QListWidget::item {
                 padding: 8px 12px; border-radius: 4px;
@@ -1717,7 +2093,7 @@ class MainWindow(QMainWindow):
         """)
         for title, _ in self._guide_contents:
             self.guide_list.addItem(title)
-        self.guide_list.setFixedWidth(210)
+        self.guide_list.setFixedWidth(263)
         self.guide_list.currentRowChanged.connect(self._on_guide_topic_changed)
 
         # Right: content browser
@@ -1726,7 +2102,7 @@ class MainWindow(QMainWindow):
         self.guide_browser.setStyleSheet(
             "QTextBrowser { background-color: #181825; color: #cdd6f4;"
             "border: 1px solid #45475a; border-radius: 6px;"
-            "padding: 16px; font-size: 12px; }")
+            "padding: 16px; font-size: 15px; }")
 
         splitter.addWidget(self.guide_list)
         splitter.addWidget(self.guide_browser)
@@ -1746,12 +2122,45 @@ class MainWindow(QMainWindow):
             _, html = self._guide_contents[index]
             self.guide_browser.setHtml(html)
 
+    def _show_viz_help_popup(self):
+        """Context help for the current Visualization chart. Reuses the Guide's
+        HTML (single source) so the tab ⓘ and Tools › Guide never drift."""
+        from PySide6.QtWidgets import QDialog, QTextBrowser
+        tab_name = self.viz_tabs.tabText(self.viz_tabs.currentIndex())
+        contents = getattr(self, "_guide_contents", None) or self._get_guide_contents()
+        html = None
+        for title, content in contents:
+            if tab_name and tab_name in title:
+                html = content
+                break
+        if html is None:
+            html = f"{self._guide_style()}<h2>{tab_name}</h2><p>설명 준비 중입니다.</p>"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"도움말 — {tab_name}")
+        dlg.setMinimumSize(720, 620)
+        dlg.setStyleSheet("QDialog { background-color: #1e1e2e; }")
+        lay = QVBoxLayout(dlg)
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        browser.setStyleSheet(
+            "QTextBrowser { background-color: #181825; color: #cdd6f4;"
+            " border: 1px solid #45475a; border-radius: 6px; padding: 16px;"
+            " font-size: 15px; }")
+        browser.setHtml(html)
+        lay.addWidget(browser, 1)
+        close_btn = QPushButton("닫기")
+        close_btn.setFixedHeight(34)
+        close_btn.clicked.connect(dlg.accept)
+        lay.addWidget(close_btn)
+        dlg.exec()
+
     @staticmethod
     def _guide_style() -> str:
         return """<style>
-            h2 { color: #89b4fa; margin-top: 12px; margin-bottom: 8px; font-size: 16px; }
-            h3 { color: #f9e2af; margin-top: 14px; margin-bottom: 4px; font-size: 13px; }
-            p, li { color: #cdd6f4; font-size: 12px; line-height: 1.6; }
+            h2 { color: #89b4fa; margin-top: 12px; margin-bottom: 8px; font-size: 20px; }
+            h3 { color: #f9e2af; margin-top: 14px; margin-bottom: 4px; font-size: 16px; }
+            p, li { color: #cdd6f4; font-size: 15px; line-height: 1.6; }
             ul { margin-left: 16px; margin-top: 4px; }
             .metric { color: #a6e3a1; font-weight: bold; }
             .note { color: #fab387; font-style: italic; }
@@ -1761,8 +2170,8 @@ class MainWindow(QMainWindow):
             .pass { color: #a6e3a1; font-weight: bold; }
             table { border-collapse: collapse; margin: 8px 0; width: 100%; }
             th { background-color: #313244; color: #89b4fa; padding: 6px 10px;
-                 text-align: left; font-size: 12px; border: 1px solid #45475a; }
-            td { padding: 5px 10px; font-size: 12px; border: 1px solid #45475a; }
+                 text-align: left; font-size: 15px; border: 1px solid #45475a; }
+            td { padding: 5px 10px; font-size: 15px; border: 1px solid #45475a; }
         </style>"""
 
     @staticmethod
@@ -1893,7 +2302,7 @@ class MainWindow(QMainWindow):
             <table>
             <tr><th>지표</th><th>공식</th><th>의미</th></tr>
             <tr><td><span class='metric'>Rep. Max</span></td>
-                <td>유효 pixel의 repeat간 Max-Min 중 최대값</td><td>재현성 최악 지점</td></tr>
+                <td>유효 pixel의 repeat간 Max-Min 중 최대값</td><td>재현성 편차 최대 지점</td></tr>
             <tr><td><span class='metric'>Rep. 1σ</span></td>
                 <td>유효 pixel별 repeat std의 RMS<br><code>sqrt(mean(pixel_stds²))</code></td><td>재현성 RMS 산포</td></tr>
             <tr><td><span class='metric'>OPM Max</span></td>
@@ -1936,39 +2345,73 @@ class MainWindow(QMainWindow):
             """),
 
             ("5. Saturation Trend", f"""{s}
-            <h2>Saturation Trend</h2>
-            <p>Repeat 수 증가에 따른 Rep. 1σ Mean 추이를 보여줍니다.</p>
+            <h2>Saturation Trend (포화 추세)</h2>
+            <p>고정 크기 <span class='key'>Best-N Window</span>(좌측 Window Size, 기본 5)를 반복 순서대로
+            <b>슬라이딩</b>하며, 각 구간의 <span class='metric'>Mean Rep. 1σ</span>(재현성 평균, 낮을수록
+            좋음)를 그립니다.</p>
 
-            <h3>읽는 방법</h3>
+            <h3>그래프 요소</h3>
             <ul>
-            <li>그래프가 <b>수렴</b>하면 현재 Repeat 수가 충분합니다.</li>
-            <li>아직 하강 추세이면 Repeat를 더 늘려야 합니다.</li>
-            <li>초기 값이 매우 높다가 급감하는 경우, 첫 Repeat에 이상이 있을 수 있습니다.</li>
+            <li><b>가로축</b> = Window 시작 Repeat 번호 / <b>세로축</b> = 그 구간의 Mean Rep. 1σ (nm)</li>
+            <li><span class='pass'>초록 별·점선</span> = <b>Best Window</b>(Rep. 1σ 최소 구간)
+                → <b>Spec 판정 기준</b></li>
+            <li><span class='fail'>빨강 점선(가로)</span> = <b>Spec 한계</b> — 점이 아래면 합격</li>
             </ul>
 
-            <h3>판단 기준</h3>
+            <h3>왜 '포화(Saturation)'인가</h3>
+            <p>장비는 측정 시작 직후 열·기구적으로 안정화됩니다. Window를 앞→뒤로 옮기며 Rep. 1σ가
+            <b>하강 후 평평</b>해지면(포화) 그 시점부터 측정이 대표성을 가집니다.</p>
+
+            <h3>해석</h3>
+            <table>
+            <tr><th>패턴</th><th>의미</th><th>조치</th></tr>
+            <tr><td>평평·낮음</td><td>처음부터 안정</td><td class='pass'>양호</td></tr>
+            <tr><td>초반↑ 후 하강</td><td>초기 Repeat 불안정(워밍업/정착)</td><td>초기 구간 배제 타당</td></tr>
+            <tr><td>계속 하강/요동</td><td>아직 미포화</td><td class='warn'>Repeat 더 필요</td></tr>
+            <tr><td>전 구간 Spec 위</td><td>재현성 자체 문제</td><td class='fail'>장비/시료 점검</td></tr>
+            </table>
+
+            <p class='note'>⚠️ 점이 1개뿐이면 Repeat 수 = Window Size라 가능한 Window가 하나뿐입니다.
+            추세를 보려면 <b>Repeat를 더 측정</b>하거나 <b>Window Size를 줄이세요</b>(예 3).</p>
+
+            <h3>활용 (QC)</h3>
             <ul>
-            <li><b>안정화 도달</b>: 마지막 3~4개 Window에서 값 변동 &lt; 10%</li>
-            <li><b>추가 Repeat 필요</b>: 여전히 하강 중이거나 변동폭이 큰 경우</li>
+            <li>적정 Repeat 수 결정(몇 회부터 안정되는가)</li>
+            <li>세션 중 재현성 열화(상승 추세) = 열 드리프트·볼스크류 윤활/정착 의심</li>
+            <li>판정에 쓰인 Best 구간을 투명하게 확인</li>
             </ul>
             """),
 
             ("6. Wafer Map", f"""{s}
-            <h2>Wafer Map</h2>
-            <p>3×3 Grid로 각 Position의 OPM Max를 Heatmap으로 표시합니다.</p>
+            <h2>Wafer Map (웨이퍼 맵)</h2>
+            <p>9개 측정 위치(1_LT~9_RB)를 <b>실제 웨이퍼 상 3×3 배치</b>(Left/Center/Right ×
+            Top/Middle/Bottom)로 그린 히트맵입니다. 색 = 선택 지표(<b>기본 OPM Max</b>), 값은
+            <span class='key'>Best Window</span> 기준.</p>
 
             <h3>색상 해석</h3>
             <ul>
-            <li><b style='color:#f38ba8'>빨간색</b>: 높은 값 (편차 큼) → 해당 위치 점검 필요</li>
-            <li><b style='color:#a6e3a1'>녹색</b>: 낮은 값 (편차 작음) → 양호</li>
+            <li><span class='pass'>녹색</span> = 낮은 값(편차 작음) → 양호</li>
+            <li><span class='fail'>빨강</span> = 높은 값(편차 큼) → 해당 위치 점검</li>
             </ul>
 
-            <h3>패턴 분석</h3>
+            <h3>공간 패턴 해석 (핵심)</h3>
+            <table>
+            <tr><th>패턴</th><th>의심 원인</th></tr>
+            <tr><td>한쪽 모서리에 빨강 집중</td><td>그 영역의 국소·구조적 문제</td></tr>
+            <tr><td>Edge &gt; Center</td><td>Sample chuck 평탄도 / 엣지 효과</td></tr>
+            <tr><td>좌우·상하 기울기(gradient)</td><td>스테이지 정렬 · 볼스크류 직진성/틸트</td></tr>
+            <tr><td>무작위 단발</td><td>파티클 / 국소 시료 결함</td></tr>
+            <tr><td>Center만 큼</td><td>시료 bow(휨)</td></tr>
+            </table>
+
+            <h3>활용 (QC)</h3>
             <ul>
-            <li>특정 영역에 빨간색이 몰려있으면 Stage의 기계적 문제를 의심합니다.</li>
-            <li>Edge vs Center 편차가 크면 Stage Flatness 점검이 필요합니다.</li>
-            <li>비대칭 패턴은 Stage 정렬(Alignment) 문제를 시사합니다.</li>
+            <li>불합격이 <b>국소(한 위치)</b>인지 <b>공간적 계통오차</b>인지 구분 → 조치 방향 결정</li>
+            <li>위치 간 비교로 점검 우선순위 설정</li>
             </ul>
+
+            <p class='note'>⚠️ 이 Wafer Map은 <b>절대값(OPM Max 등)</b>입니다. Admin 진단의 '공간 패턴'은
+            <b>이상치 제거량(Rep. Max 감소분)</b>이라 의미가 달라, 같은 위치라도 수치가 다를 수 있습니다.</p>
             """),
 
             ("7. Best-5 Window", f"""{s}
@@ -2301,7 +2744,7 @@ class MainWindow(QMainWindow):
             recipes={recipe.range_label: recipe}
         )
         self._populate_range_selector()
-        self.path_label.setText(
+        self._set_data_path(
             f"{recipe.directory} — {recipe.range_label} ({recipe.repeat_count} repeats)")
 
     def _on_multi_loaded(self, dataset: DataSet):
@@ -2317,7 +2760,7 @@ class MainWindow(QMainWindow):
 
         total = sum(r.repeat_count for r in dataset.recipes.values())
         ranges = ", ".join(dataset.available_ranges)
-        self.path_label.setText(f"{dataset.root_directory} — {ranges} ({total} total repeats)")
+        self._set_data_path(f"{dataset.root_directory} — {ranges} ({total} total repeats)")
 
     def _on_load_error(self, msg: str):
         self.load_btn.setEnabled(True)
@@ -2392,27 +2835,27 @@ class MainWindow(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Spec Reference Table")
-        dlg.setMinimumSize(600, 400)
+        dlg.setMinimumSize(750, 500)
         dlg.setStyleSheet(
             "QDialog { background-color: #1e1e2e; }"
             "QLabel { color: #cdd6f4; }"
             "QTableWidget { background-color: #181825; color: #cdd6f4;"
-            "gridline-color: #313244; border: 1px solid #45475a; font-size: 13px; }"
+            "gridline-color: #313244; border: 1px solid #45475a; font-size: 16px; }"
             "QTableWidget::item { padding: 6px; }"
             "QHeaderView::section { background-color: #313244; color: #89b4fa;"
-            "padding: 8px; border: 1px solid #45475a; font-weight: bold; font-size: 13px; }")
+            "padding: 8px; border: 1px solid #45475a; font-weight: bold; font-size: 16px; }")
 
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(16, 16, 16, 16)
 
         title = QLabel("Sliding Stage Spec Limits")
-        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #89b4fa;")
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #89b4fa;")
         layout.addWidget(title)
 
         equip_type = "iso" if self.radio_iso.isChecked() else "dw"
         equip_label = "Isolated AE" if equip_type == "iso" else "Double Walled AE"
         current_label = QLabel(f"Current: {equip_label}")
-        current_label.setStyleSheet("font-size: 12px; color: #a6adc8; margin-bottom: 8px;")
+        current_label.setStyleSheet("font-size: 15px; color: #a6adc8; margin-bottom: 8px;")
         layout.addWidget(current_label)
 
         table = QTableWidget()
@@ -2420,7 +2863,7 @@ class MainWindow(QMainWindow):
         table.setHorizontalHeaderLabels([
             "Range", "OPM\nRepeatability",
             "Max OPM\n(Double Walled)", "Max OPM\n(Isolated)", "Basis"])
-        table.horizontalHeader().setMinimumHeight(44)
+        table.horizontalHeader().setMinimumHeight(55)
 
         ranges = [25, 10, 5, 1]
         table.setRowCount(len(ranges))
@@ -2451,13 +2894,13 @@ class MainWindow(QMainWindow):
             "\u2022 OPM Repeatability: Based on Rep. 1\u03c3 (DW=Center, ISO=Total RMS)\n"
             "\u2022 Max OPM: Based on max OPM value (DW=Center, ISO=Total Max)\n"
             "\u2022 Both items must PASS to qualify")
-        note.setStyleSheet("font-size: 11px; color: #a6adc8; padding: 8px;")
+        note.setStyleSheet("font-size: 14px; color: #a6adc8; padding: 8px;")
         layout.addWidget(note)
 
         close_btn = QPushButton("Close")
         close_btn.setStyleSheet(
             "QPushButton { background-color: #45475a; color: #cdd6f4;"
-            "padding: 8px 24px; border-radius: 4px; font-size: 13px; }"
+            "padding: 8px 24px; border-radius: 4px; font-size: 16px; }"
             "QPushButton:hover { background-color: #585b70; }")
         close_btn.clicked.connect(dlg.close)
         layout.addWidget(close_btn, alignment=Qt.AlignRight)
@@ -2525,6 +2968,7 @@ class MainWindow(QMainWindow):
         self._update_profile_chart()
         self._update_trend_chart()
         self._update_wafer_map()
+        self._update_spatial_map()
         self._update_best5_chart()
         self._update_time_tab()
         self._update_resolution_compare()
@@ -2596,7 +3040,7 @@ class MainWindow(QMainWindow):
             return
         rows = get_dual_summary_table(
             self.current_result, self.current_result_robust, use_best_window=True)
-        self.summary_table.verticalHeader().setDefaultSectionSize(34)
+        self.summary_table.verticalHeader().setDefaultSectionSize(43)
         self.summary_table.setRowCount(len(rows))
         metric_keys = ["Rep. Max (nm)", "Rep. 1σ (nm)", "OPM Max (nm)", "OPM 1σ (nm)"]
         cols = ["Range", "Position"] + metric_keys
@@ -2642,11 +3086,11 @@ class MainWindow(QMainWindow):
                     item.setTextAlignment(Qt.AlignCenter)
                     if is_total:
                         item.setBackground(QColor("#313244"))
-                        item.setFont(QFont("Segoe UI", 11, QFont.Bold))
+                        item.setFont(QFont("Segoe UI", 14, QFont.Bold))
                     elif is_group:
                         item.setBackground(QColor("#1e1e2e"))
                         item.setForeground(QColor("#f9e2af"))
-                        item.setFont(QFont("Segoe UI", 11, QFont.Bold))
+                        item.setFont(QFont("Segoe UI", 14, QFont.Bold))
                     self.summary_table.setItem(i, j, item)
 
     def _update_spec_display(self):
@@ -2689,8 +3133,8 @@ class MainWindow(QMainWindow):
                 line += f" <span style='color:#a6adc8'>[{src}]</span>"
             if rr is not None and rr.spec_value is not None:
                 rob_icon = "\u2705" if rr.spec_pass else "\u274c"
-                line += (f"  <span style='color:#a6adc8'>(이상치 제외값 {rob_icon} "
-                         f"{rr.spec_value:.3f})</span>")
+                line += (f"<br><span style='color:#a6adc8'>&nbsp;&nbsp;↳ 이상치 제외값: "
+                         f"{rob_icon} {rr.spec_value:.3f} nm</span>")
             lines.append("")
             lines.append(line)
 
@@ -2704,8 +3148,8 @@ class MainWindow(QMainWindow):
                 line += f" <span style='color:#a6adc8'>[{src}]</span>"
             if rr is not None and rr.spec_opm_value is not None:
                 rob_icon = "\u2705" if rr.spec_opm_pass else "\u274c"
-                line += (f"  <span style='color:#a6adc8'>(이상치 제외값 {rob_icon} "
-                         f"{rr.spec_opm_value:.3f})</span>")
+                line += (f"<br><span style='color:#a6adc8'>&nbsp;&nbsp;↳ 이상치 제외값: "
+                         f"{rob_icon} {rr.spec_opm_value:.3f} nm</span>")
             lines.append(line)
 
         # Flag when raw vs robust verdict disagrees (= an outlier flipped the result).
@@ -2723,15 +3167,15 @@ class MainWindow(QMainWindow):
             if overall:
                 self.spec_verdict_label.setText("PASS")
                 self.spec_verdict_label.setStyleSheet(
-                    "font-size: 18px; font-weight: bold; color: #a6e3a1; padding: 4px;")
+                    "font-size: 23px; font-weight: bold; color: #a6e3a1; padding: 4px;")
             else:
                 self.spec_verdict_label.setText("FAIL")
                 self.spec_verdict_label.setStyleSheet(
-                    "font-size: 18px; font-weight: bold; color: #f38ba8; padding: 4px;")
+                    "font-size: 23px; font-weight: bold; color: #f38ba8; padding: 4px;")
         else:
             self.spec_verdict_label.setText("\u2014")
             self.spec_verdict_label.setStyleSheet(
-                "font-size: 18px; font-weight: bold; padding: 4px;")
+                "font-size: 23px; font-weight: bold; padding: 4px;")
 
     def _create_msa_tab(self) -> QWidget:
         """MSA / Gauge R&R tab: verdict summary + per-position chart + table."""
@@ -2744,7 +3188,7 @@ class MainWindow(QMainWindow):
         self.msa_summary_label.setWordWrap(True)
         self.msa_summary_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.msa_summary_label.setStyleSheet(
-            "font-size: 12px; color: #cdd6f4; padding: 4px;")
+            "font-size: 15px; color: #cdd6f4; padding: 4px;")
         layout.addWidget(self.msa_summary_label)
 
         self.msa_canvas = FigureCanvas(Figure(figsize=(10, 4)))
@@ -2758,7 +3202,7 @@ class MainWindow(QMainWindow):
         self.msa_table.verticalHeader().setVisible(False)
         self.msa_table.setAlternatingRowColors(True)
         self.msa_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.msa_table.setMaximumHeight(240)
+        self.msa_table.setMaximumHeight(300)
         layout.addWidget(self.msa_table)
 
         return widget
@@ -2802,7 +3246,7 @@ class MainWindow(QMainWindow):
             f"{scope}<br>"
             f"특성치 {m.characteristic} · 부품 {m.n_parts} · 시행 {m.n_trials} · "
             f"{m.study_sigma:.3g}σ<br>"
-            f"<span style='color:{color}; font-size:15px; font-weight:bold'>"
+            f"<span style='color:{color}; font-size:19px; font-weight:bold'>"
             f"판정: {m.verdict}</span> "
             "<span style='color:#a6adc8'>(&lt;10% 우수 · 10–30% 조건부 · &gt;30% 부적합)</span><br>"
             f"EV(반복성) {m.ev:.3f} · PV(부품) {m.pv:.3f} · TV {m.tv:.3f} nm<br>"
@@ -2977,6 +3421,35 @@ class MainWindow(QMainWindow):
         fig = create_wafer_map_figure(self.current_result, metric="rep_max", figsize=(8, 7))
         self._update_canvas(self.wafer_canvas, fig)
 
+    def _update_spatial_map(self):
+        if not getattr(self, "current_result", None):
+            return
+        fig = create_spatial_wafer_map_figure(
+            self.current_result, self.current_recipe, metric="opm_max", figsize=(8, 7))
+        self._update_canvas(self.spatial_canvas, fig)
+        self._update_spatial_table()
+
+    def _update_spatial_table(self):
+        """Quantitative companion to the Spatial Map: real stage XY + metrics."""
+        if not hasattr(self, "spatial_table"):
+            return
+        from ..visualization.plot_manager import _position_xy_mm, _position_metric
+        xy = _position_xy_mm(self.current_recipe)
+        opm = _position_metric(self.current_result, "opm_max")
+        rep = _position_metric(self.current_result, "rep_max")
+        rows = [p for p in POSITION_LABELS if p in xy]
+        self.spatial_table.setRowCount(len(rows))
+        for i, pos in enumerate(rows):
+            x, y = xy[pos]
+            cells = [pos, f"{x:.1f}", f"{y:.1f}",
+                     f"{opm[pos]:.1f}" if pos in opm else "—",
+                     f"{rep[pos]:.1f}" if pos in rep else "—"]
+            for c, v in enumerate(cells):
+                item = QTableWidgetItem(v)
+                if c >= 1:
+                    item.setTextAlignment(Qt.AlignCenter)
+                self.spatial_table.setItem(i, c, item)
+
     def _update_best5_chart(self):
         if not self.current_result:
             return
@@ -3012,10 +3485,10 @@ class MainWindow(QMainWindow):
 
         if t.is_continuous:
             self.time_continuous_label.setText("Continuous")
-            self.time_continuous_label.setStyleSheet("font-size: 14px; color: #a6e3a1;")
+            self.time_continuous_label.setStyleSheet("font-size: 18px; color: #a6e3a1;")
         else:
             self.time_continuous_label.setText("Gaps detected")
-            self.time_continuous_label.setStyleSheet("font-size: 14px; color: #f9e2af;")
+            self.time_continuous_label.setStyleSheet("font-size: 18px; color: #f9e2af;")
 
         # Estimation
         self._update_time_estimate()
@@ -3069,7 +3542,7 @@ class MainWindow(QMainWindow):
         """Reset Ball Screw tab to empty state."""
         self.bs_verdict_label.setText("—")
         self.bs_verdict_label.setStyleSheet(
-            "font-size: 16px; font-weight: bold; border: 2px solid #45475a;"
+            "font-size: 20px; font-weight: bold; border: 2px solid #45475a;"
             "border-radius: 6px; padding: 4px; color: #a6adc8;")
         self.bs_table.clear()
         self.bs_table.setRowCount(0)
@@ -3091,12 +3564,12 @@ class MainWindow(QMainWindow):
         if bs.overall_pass:
             self.bs_verdict_label.setText("PASS")
             self.bs_verdict_label.setStyleSheet(
-                "font-size: 16px; font-weight: bold; border: 2px solid #a6e3a1;"
+                "font-size: 20px; font-weight: bold; border: 2px solid #a6e3a1;"
                 "border-radius: 6px; padding: 4px; color: #a6e3a1;")
         else:
             self.bs_verdict_label.setText("FAIL")
             self.bs_verdict_label.setStyleSheet(
-                "font-size: 16px; font-weight: bold; border: 2px solid #f38ba8;"
+                "font-size: 20px; font-weight: bold; border: 2px solid #f38ba8;"
                 "border-radius: 6px; padding: 4px; color: #f38ba8;")
 
         positions, rep_labels, dishing_matrix = get_dishing_matrix(
@@ -3223,7 +3696,7 @@ class MainWindow(QMainWindow):
                 elif col_i == len(row_data) - 1:  # Spec column
                     if spec_txt == "FAIL":
                         item.setForeground(QColor("#f38ba8"))
-                        item.setFont(QFont("Segoe UI", 10, QFont.Bold))
+                        item.setFont(QFont("Segoe UI", 13, QFont.Bold))
                     elif spec_txt == "PASS":
                         item.setForeground(QColor("#a6e3a1"))
                 else:  # Value cells
@@ -3389,7 +3862,7 @@ def run_app():
             Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    app.setFont(QFont("Segoe UI", 10))
+    app.setFont(QFont("Segoe UI", 13))
 
     window = MainWindow()
     window.show()

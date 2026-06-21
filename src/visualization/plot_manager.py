@@ -93,7 +93,8 @@ def _shade_columns(ax, mask: np.ndarray, color: str, alpha: float = 0.18) -> Non
 
 def create_outlier_illustration_figure(recipe, mode: str = "percentile",
                                        value: float = 1.0, position: str | None = None,
-                                       figsize: tuple = (8.6, 6.0)) -> Figure:
+                                       figsize: tuple = (8.6, 6.0),
+                                       show_mm: bool = False) -> Figure:
     """Educational 2-panel figure showing which pixels outlier-exclusion drops.
 
     Top: every repeat profile for a position overlaid, with the excluded (high
@@ -139,6 +140,14 @@ def create_outlier_illustration_figure(recipe, mode: str = "percentile",
         mode, value = "percentile", 5.0
 
     n_rep, n_px = stack.shape
+    # Physical stage-travel axis (mm) for the chosen position, so the user can read
+    # WHERE an outlier sits on the ball-screw travel, not just a pixel index.
+    x_mm_sel = None
+    if not synthetic and recipe is not None:
+        for r in recipe.repeats:
+            if title_pos in r.profiles:
+                x_mm_sel = np.asarray(r.profiles[title_pos].x_mm, dtype=float)
+                break
     px = np.arange(n_px)
     pixel_range = stack.max(axis=0) - stack.min(axis=0)
     valid = _exclude_outlier_pixels(stack, mode, value)
@@ -167,15 +176,29 @@ def create_outlier_illustration_figure(recipe, mode: str = "percentile",
                     s=12, zorder=5, label="제외 픽셀")
     ax2.set_xlabel("Pixel", fontproperties=_KFONT)
     ax2.set_ylabel("Range (nm)", fontproperties=_KFONT)
+    # Optional physical mm axis (stage travel) on top of the range panel.
+    if show_mm and x_mm_sel is not None and len(x_mm_sel) == n_px:
+        def _p2mm(p):
+            return np.interp(p, px, x_mm_sel)
+
+        def _mm2p(m):
+            return np.interp(m, x_mm_sel, px)
+
+        secax = ax2.secondary_xaxis("top", functions=(_p2mm, _mm2p))
+        secax.set_xlabel("Stage 위치 (mm)", fontproperties=_KFONT, fontsize=8)
+        secax.tick_params(colors=COLORS["fg"], labelsize=7)
     leg = ax2.legend(prop=_KFONT, fontsize=7, facecolor=COLORS["bg"],
                      edgecolor=COLORS["grid"], labelcolor=COLORS["fg"])
     if leg:
         leg.get_frame().set_alpha(0.6)
 
-    # Before/after Rep.Max caption
+    # Before/after Rep.Max caption (+ physical location of the worst-deviation pixel)
     after = float(pixel_range[valid].max()) if valid.any() else 0.0
+    loc = ""
+    if x_mm_sel is not None and len(x_mm_sel) == n_px:
+        loc = f"   ·   최대 편차 위치 {float(x_mm_sel[int(np.argmax(pixel_range))]):.2f} mm"
     fig.text(0.5, 0.012,
-             f"Rep.Max (픽셀 편차 최대): 전체 {pixel_range.max():.2f} → 제외 후 {after:.2f} nm",
+             f"Rep.Max (픽셀 편차 최대): 전체 {pixel_range.max():.2f} → 제외 후 {after:.2f} nm{loc}",
              ha="center", color=COLORS["fg"], fontsize=8.5, fontproperties=_KFONT)
     fig.tight_layout(rect=[0, 0.04, 1, 1])
     return fig
@@ -422,6 +445,113 @@ def create_wafer_map_figure(result: AnalysisResult,
     return fig
 
 
+def create_outlier_wafer_map_figure(recipe, mode: str = "percentile",
+                                    value: float = 1.0,
+                                    figsize: tuple = (8, 7)) -> Figure:
+    """3x3 wafer map of per-position outlier severity (Rep.Max 전체 - 제외 후, nm).
+
+    Shows WHERE across the 9-point grid the transient outliers concentrate — a
+    spatial pattern that helps separate a localized sample issue from a systematic
+    (chuck/stage) one. Mirrors create_wafer_map_figure."""
+    from ..core.diagnostics import compute_outlier_wafer_metric
+
+    fig, ax = plt.subplots(figsize=figsize)
+    fig.set_facecolor(COLORS["bg"])
+    _apply_dark_theme(ax, fig)
+
+    metric = compute_outlier_wafer_metric(recipe, mode, value)
+    data = np.full((3, 3), np.nan)
+    for pos, val in metric.items():
+        if pos in POSITION_GRID:
+            r, c = POSITION_GRID[pos]
+            data[r][c] = val
+
+    im = ax.imshow(data, cmap="RdYlGn_r", aspect="equal", interpolation="nearest")
+    for pos in POSITION_LABELS:
+        if pos in POSITION_GRID:
+            r, c = POSITION_GRID[pos]
+            val = data[r][c]
+            label = f"{pos}\n{val:.1f}" if not np.isnan(val) else pos
+            ax.text(c, r, label, ha="center", va="center", color="white",
+                    fontsize=9, fontweight="bold")
+
+    ax.set_xticks([0, 1, 2]); ax.set_yticks([0, 1, 2])
+    ax.set_xticklabels(["Left", "Center", "Right"], color=COLORS["fg"])
+    ax.set_yticklabels(["Top", "Middle", "Bottom"], color=COLORS["fg"])
+    ax.set_title("이상치 공간 패턴 — Rep.Max 감소량 (전체 - 제외 후)\n"
+                 "※ 절대 Rep.Max는 Visualization > Wafer Map 참고",
+                 fontsize=10, color=COLORS["fg"], fontweight="bold",
+                 fontproperties=_KFONT)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8)
+    cbar.ax.tick_params(colors=COLORS["fg"])
+    cbar.set_label("nm", color=COLORS["fg"])
+    fig.tight_layout(pad=2.0)
+    return fig
+
+
+def create_periodicity_figure(recipe, position: str, lead_mm: float | None = None,
+                              figsize: tuple = (8.6, 4.2)) -> Figure:
+    """Spatial-frequency spectrum of the per-pixel repeat range for one position.
+
+    A strong peak at the ball-screw lead period is a structural (ball-screw)
+    signature. The dominant period is marked; an optional user lead is overlaid."""
+    from ..core.diagnostics import dominant_spatial_period
+
+    fig = Figure(figsize=figsize)
+    fig.set_facecolor(COLORS["bg"])
+    ax = fig.add_subplot(1, 1, 1)
+    _apply_dark_theme(ax, fig)
+
+    profs, x_mm = [], None
+    if recipe is not None and getattr(recipe, "repeats", None):
+        for r in recipe.repeats:
+            if position in r.profiles:
+                profs.append(edge_only_flatten(r.profiles[position].z_nm, order=1,
+                                               edge_percent=1.0))
+                if x_mm is None:
+                    x_mm = np.asarray(r.profiles[position].x_mm, dtype=float)
+
+    if len(profs) < 2 or x_mm is None or len(x_mm) < 16:
+        ax.text(0.5, 0.5, "주기성 분석 불가 (반복/데이터 부족)", transform=ax.transAxes,
+                ha="center", va="center", color=COLORS["fg"], fontproperties=_KFONT)
+        fig.tight_layout()
+        return fig
+
+    stack = np.asarray(profs, dtype=np.float64)
+    pr = stack.max(axis=0) - stack.min(axis=0)
+    dx = float(abs(x_mm[1] - x_mm[0]))
+    n = len(pr)
+    xx = np.arange(n, dtype=float)
+    y = pr - pr.mean()
+    y = y - np.polyval(np.polyfit(xx, y, 1), xx)
+    spec = np.abs(np.fft.rfft(y * np.hanning(n))) ** 2
+    freqs = np.fft.rfftfreq(n, d=dx)
+    band = freqs >= 2.0 / (n * dx)
+    with np.errstate(divide="ignore"):
+        periods = np.where(freqs > 0, 1.0 / freqs, np.nan)
+
+    ax.plot(periods[band], spec[band], color=COLORS["accent"], lw=1.0)
+    ax.set_xscale("log")
+    ax.set_xlabel("공간 주기 (mm)", fontproperties=_KFONT)
+    ax.set_ylabel("Power", fontproperties=_KFONT)
+
+    per, _pw = dominant_spatial_period(pr, dx)
+    if per > 0:
+        ax.axvline(per, color=COLORS["yellow"], ls="--", lw=1.0,
+                   label=f"지배 주기 {per:.3f} mm")
+    if lead_mm and lead_mm > 0:
+        ax.axvline(lead_mm, color=COLORS["red"], ls=":", lw=1.3,
+                   label=f"입력 리드 {lead_mm:.3f} mm")
+    leg = ax.legend(prop=_KFONT, fontsize=8, facecolor=COLORS["bg"],
+                    edgecolor=COLORS["grid"], labelcolor=COLORS["fg"])
+    if leg:
+        leg.get_frame().set_alpha(0.6)
+    ax.set_title(f"공간 주기 스펙트럼 — {position}  (반복 편차 Max-Min)",
+                 fontproperties=_KFONT, fontsize=10, fontweight="bold")
+    fig.tight_layout()
+    return fig
+
+
 def create_best5_comparison_figure(result: AnalysisResult,
                                     figsize: tuple = (12, 6)) -> Figure:
     """Compare Best-5 Window vs All Repeats statistics."""
@@ -578,4 +708,103 @@ def create_resolution_comparison_figure(
     fig.suptitle("Cross-Range Resolution Comparison",
                  fontsize=14, color=COLORS["fg"], fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.94])
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Spatial (real stage-XY) views — reference aids, NOT verdicts
+# --------------------------------------------------------------------------- #
+
+def _position_xy_mm(recipe) -> dict:
+    """Map position label -> (x_mm, y_mm) from the Info-CSV stage coordinates.
+
+    Falls back to a schematic 3×3 layout (mimicking the real ±85mm / 80mm
+    spacing) when coordinates are missing or all zero (datasets without an
+    Info CSV use the filename fallback with x_um=y_um=0)."""
+    xy = {}
+    if recipe is not None and getattr(recipe, "repeats", None):
+        for p in recipe.repeats[0].valid_points:
+            xy[p.position] = (p.x_um / 1000.0, p.y_um / 1000.0)
+    coords = list(xy.values())
+    degenerate = (not coords) or all(abs(x) < 1e-6 and abs(y) < 1e-6
+                                     for x, y in coords)
+    if degenerate:
+        xy = {pos: (-90.0 + c * 80.0, 85.0 - r * 85.0)
+              for pos, (r, c) in POSITION_GRID.items()}
+    return xy
+
+
+def _position_metric(result, metric: str) -> dict:
+    """Per-position scalar (best window if available, else all repeats)."""
+    src = None
+    if result is not None:
+        src = result.best_window.positions if result.best_window else result.all_positions
+    out = {}
+    if src:
+        for pos, pr in src.items():
+            out[pos] = float(getattr(pr, metric, pr.opm_max))
+    return out
+
+
+_METRIC_LABELS = {"opm_max": "OPM Max", "rep_max": "Rep. Max",
+                  "rep_1sigma": "Rep. 1σ", "opm_1sigma": "OPM 1σ"}
+
+
+def _metric_label(metric: str) -> str:
+    return _METRIC_LABELS.get(metric, metric.replace("_", " ").title())
+
+
+def create_spatial_wafer_map_figure(result, recipe, metric: str = "opm_max",
+                                    figsize: tuple = (8, 7)) -> Figure:
+    """9 measurement points at their REAL stage XY (mm), colored/sized by metric.
+
+    Projects the per-position metric onto the physical wafer layout so edge-vs-
+    center patterns (chuck flatness / edge effects) read at a glance. Reference
+    aid — official judgment stays the Spec-panel aggregate."""
+    from matplotlib.patches import Circle
+
+    fig, ax = plt.subplots(figsize=figsize)
+    _apply_dark_theme(ax, fig)
+
+    xy = _position_xy_mm(recipe)
+    vals = _position_metric(result, metric)
+    xs, ys, cs, labels = [], [], [], []
+    for pos in POSITION_LABELS:
+        if pos in xy:
+            x, y = xy[pos]
+            xs.append(x); ys.append(y)
+            cs.append(vals.get(pos, np.nan)); labels.append(pos)
+
+    # 300mm wafer outline for edge-proximity context.
+    ax.add_patch(Circle((0, 0), 150.0, fill=False, ls="--", lw=1.0,
+                        ec=COLORS["grid"], zorder=1))
+
+    finite = [c for c in cs if np.isfinite(c)]
+    vmax = max(finite) if finite else 1.0
+    sizes = [300 + 700 * (c / vmax) if (np.isfinite(c) and vmax > 0) else 300
+             for c in cs]
+    sc = ax.scatter(xs, ys, c=cs, cmap="RdYlGn_r", s=sizes, edgecolors="white",
+                    linewidths=1.0, zorder=3)
+    import matplotlib.patheffects as pe
+    _halo = [pe.withStroke(linewidth=2.5, foreground="white")]  # readable on any color
+    for x, y, c, lab in zip(xs, ys, cs, labels):
+        txt = f"{lab}\n{c:.1f}" if np.isfinite(c) else lab
+        ax.annotate(txt, (x, y), ha="center", va="center", color="#11111b",
+                    fontsize=8, fontweight="bold", fontproperties=_KFONT, zorder=4,
+                    path_effects=_halo)
+
+    ax.set_xlim(-170, 170); ax.set_ylim(-170, 170)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Stage X (mm)", fontproperties=_KFONT)
+    ax.set_ylabel("Stage Y (mm)", fontproperties=_KFONT)
+    metric_label = _metric_label(metric)
+    rl = result.range_label if result is not None else ""
+    ax.set_title(f"Spatial Map — {rl} ({metric_label}, nm)\n실제 스테이지 좌표 · 참고용",
+                 fontproperties=_KFONT, fontsize=11, color=COLORS["fg"],
+                 fontweight="bold")
+    if np.isfinite(cs).any() if len(cs) else False:
+        cbar = fig.colorbar(sc, ax=ax, shrink=0.8)
+        cbar.ax.tick_params(colors=COLORS["fg"])
+        cbar.set_label("nm", color=COLORS["fg"])
+    fig.tight_layout()
     return fig
