@@ -15,7 +15,7 @@ from ..core import app_config
 # app-wide), so carry a compact dark theme to match the app.
 _DIALOG_QSS = (
     "QDialog { background-color: #1e1e2e; }"
-    "QLabel { color: #cdd6f4; font-size: 12px; }"
+    "QLabel { color: #cdd6f4; font-size: 15px; }"
     "QLineEdit { background-color: #181825; color: #cdd6f4;"
     " border: 1px solid #45475a; border-radius: 4px; padding: 4px; }"
     "QPushButton { background-color: #313244; color: #cdd6f4;"
@@ -31,7 +31,7 @@ class _PinDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.setMinimumWidth(280)
+        self.setMinimumWidth(350)
         self.setStyleSheet(_DIALOG_QSS)
 
         lay = QVBoxLayout(self)
@@ -43,7 +43,7 @@ class _PinDialog(QDialog):
         lay.addWidget(self.edit)
 
         self.msg = QLabel("")
-        self.msg.setStyleSheet("color: #f38ba8; font-size: 11px;")
+        self.msg.setStyleSheet("color: #f38ba8; font-size: 14px;")
         lay.addWidget(self.msg)
 
         row = QHBoxLayout()

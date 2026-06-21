@@ -16,7 +16,7 @@ from ..core import spec_config
 
 _DIALOG_QSS = (
     "QDialog { background-color: #1e1e2e; }"
-    "QLabel { color: #cdd6f4; font-size: 12px; }"
+    "QLabel { color: #cdd6f4; font-size: 15px; }"
     "QLineEdit, QComboBox, QDoubleSpinBox, QListWidget {"
     " background-color: #181825; color: #cdd6f4;"
     " border: 1px solid #45475a; border-radius: 4px; padding: 4px; }"
@@ -41,7 +41,7 @@ class PresetManagerDialog(QDialog):
     def __init__(self, parent, current: dict, range_mm: Optional[int]):
         super().__init__(parent)
         self.setWindowTitle("Spec 프리셋 관리")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(575)
         self.setStyleSheet(_DIALOG_QSS)
         self._range_mm = range_mm
         self.selected_name: Optional[str] = None

@@ -46,7 +46,7 @@ _COLORS = {
 DARK_STYLE = """
 QDialog { background-color: #1e1e2e; }
 QLabel { color: #cdd6f4; }
-QCheckBox { color: #cdd6f4; font-size: 12px; spacing: 4px; }
+QCheckBox { color: #cdd6f4; font-size: 15px; spacing: 4px; }
 QCheckBox::indicator { width: 14px; height: 14px; }
 QCheckBox::indicator:checked {
     background-color: #89b4fa; border: 2px solid #b4befe; border-radius: 3px; }
@@ -55,17 +55,17 @@ QCheckBox::indicator:unchecked {
 QGroupBox {
     border: 1px solid #45475a; border-radius: 6px;
     margin-top: 8px; padding-top: 16px;
-    font-weight: bold; color: #89b4fa; font-size: 12px;
+    font-weight: bold; color: #89b4fa; font-size: 15px;
 }
 QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }
 QTableWidget {
     background-color: #181825; color: #cdd6f4;
-    gridline-color: #313244; border: 1px solid #45475a; font-size: 12px;
+    gridline-color: #313244; border: 1px solid #45475a; font-size: 15px;
 }
 QTableWidget::item { padding: 4px; }
 QHeaderView::section {
     background-color: #313244; color: #89b4fa;
-    padding: 6px; border: 1px solid #45475a; font-weight: bold; font-size: 12px;
+    padding: 6px; border: 1px solid #45475a; font-weight: bold; font-size: 15px;
 }
 """
 
@@ -152,9 +152,9 @@ class PositionDetailDialog(QDialog):
         self.plot_widget.addItem(self.hline, ignoreBounds=True)
         self.crosshair_label = QLabel("X: — mm  Y: — nm")
         self.crosshair_label.setStyleSheet(
-            "font-size: 11px; color: #a6adc8; padding: 2px 6px;"
+            "font-size: 14px; color: #a6adc8; padding: 2px 6px;"
             "background-color: #181825; border-radius: 3px;")
-        self.crosshair_label.setFixedHeight(22)
+        self.crosshair_label.setFixedHeight(28)
         self.plot_widget.scene().sigMouseMoved.connect(self._on_mouse_moved)
         self.plot_widget.scene().sigMouseClicked.connect(self._on_plot_clicked)
 
@@ -169,17 +169,17 @@ class PositionDetailDialog(QDialog):
         # Title
         title = QLabel(f"{self.position} — {self.recipe.range_label}")
         title.setStyleSheet(
-            "font-size: 16px; font-weight: bold; color: #89b4fa; padding: 4px;")
+            "font-size: 20px; font-weight: bold; color: #89b4fa; padding: 4px;")
         right_panel.addWidget(title)
 
         subtitle = QLabel(f"{len(self.profiles)} Repeats")
-        subtitle.setStyleSheet("font-size: 12px; color: #a6adc8; padding: 0 4px;")
+        subtitle.setStyleSheet("font-size: 15px; color: #a6adc8; padding: 0 4px;")
         right_panel.addWidget(subtitle)
 
         # Interaction hint
         hint = QLabel("Scroll: Zoom  |  Drag: Pan  |  Right-click: Menu")
         hint.setStyleSheet(
-            "font-size: 10px; color: #585b70; padding: 2px 4px; font-style: italic;")
+            "font-size: 13px; color: #585b70; padding: 2px 4px; font-style: italic;")
         right_panel.addWidget(hint)
 
         # ─── Repeat Checkboxes ───
@@ -243,14 +243,14 @@ class PositionDetailDialog(QDialog):
             self.opm_table.setItem(i, 1, v_item)
         self.opm_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.opm_table.verticalHeader().setVisible(False)
-        self.opm_table.setMaximumHeight(min(30 * len(self.profiles) + 30, 200))
+        self.opm_table.setMaximumHeight(min(38 * len(self.profiles) + 38, 250))
         stats_layout.addWidget(self.opm_table)
 
         # Summary
         self.summary_label = QLabel()
         self.summary_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.summary_label.setStyleSheet(
-            "font-size: 12px; color: #cdd6f4; padding: 6px;"
+            "font-size: 15px; color: #cdd6f4; padding: 6px;"
             "background-color: #181825; border-radius: 4px;")
         self.summary_label.setWordWrap(True)
         self._update_summary()
@@ -449,7 +449,7 @@ class PositionDetailDialog(QDialog):
         self.measure_header = QLabel("두 점을 클릭하거나 밴드를 드래그하세요.")
         self.measure_header.setWordWrap(True)
         self.measure_header.setStyleSheet(
-            "font-size: 11px; color: #a6adc8; padding: 2px 4px;")
+            "font-size: 14px; color: #a6adc8; padding: 2px 4px;")
         mlay.addWidget(self.measure_header)
 
         self.measure_table = QTableWidget()
@@ -457,12 +457,12 @@ class PositionDetailDialog(QDialog):
         self.measure_table.setHorizontalHeaderLabels(["Repeat", "구간 OPM (nm)"])
         self.measure_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.measure_table.verticalHeader().setVisible(False)
-        self.measure_table.setMaximumHeight(min(28 * len(self.profiles) + 28, 180))
+        self.measure_table.setMaximumHeight(min(35 * len(self.profiles) + 35, 225))
         mlay.addWidget(self.measure_table)
 
         self.measure_across = QLabel("")
         self.measure_across.setStyleSheet(
-            "font-size: 12px; color: #f9e2af; font-weight: bold; padding: 2px 4px;")
+            "font-size: 15px; color: #f9e2af; font-weight: bold; padding: 2px 4px;")
         mlay.addWidget(self.measure_across)
 
         parent_layout.addWidget(measure_group)
